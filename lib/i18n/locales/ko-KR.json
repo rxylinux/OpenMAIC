@@ -1715,6 +1715,7 @@
     "providerNanoBanana": "Nano Banana (Gemini)",
     "providerMiniMaxImage": "MiniMax Image",
     "providerGrokImage": "Grok Image (xAI)",
+    "providerGlmImage": "GLM 이미지 생성(Zhipu)",
     "providerOpenRouterImage": "OpenRouter Image",
     "providerComfyUIImage": "ComfyUI Image",
     "providerLemonadeImage": "Lemonade Image (로컬)",

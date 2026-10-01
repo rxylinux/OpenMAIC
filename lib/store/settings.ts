@@ -594,6 +594,7 @@ const getDefaultImageConfig = () => ({
     'nano-banana': { apiKey: '', baseUrl: '', enabled: false },
     'minimax-image': { apiKey: '', baseUrl: '', enabled: false },
     'grok-image': { apiKey: '', baseUrl: '', enabled: false },
+    'glm-image': { apiKey: '', baseUrl: '', enabled: false },
     'openrouter-image': { apiKey: '', baseUrl: '', enabled: false },
     'comfyui-image': { apiKey: '', baseUrl: '', enabled: false },
     lemonade: { apiKey: '', baseUrl: '', enabled: false },

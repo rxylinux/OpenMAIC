@@ -47,6 +47,7 @@ const IMAGE_PROVIDER_ICONS: Record<string, string> = {
   'qwen-image': '/logos/bailian.svg',
   'nano-banana': '/logos/gemini.svg',
   'grok-image': '/logos/grok.svg',
+  'glm-image': '/logos/glm.svg',
   'comfyui-image': '/logos/comfyui.svg',
   'openrouter-image': '/logos/openrouter.svg',
 };
