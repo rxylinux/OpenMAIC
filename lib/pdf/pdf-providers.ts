@@ -146,6 +146,7 @@ import { createLogger } from '@/lib/logger';
 import { extractMinerUResult } from './mineru-parser';
 import { parseWithMinerUCloud } from './mineru-cloud';
 import { parseWithAliDocMindClient } from './alidocmind-client';
+import { preparePdfImage } from '@/lib/document/extractors/images';
 
 const log = createLogger('PDFProviders');
 const DEFAULT_MINERU_BACKEND = 'pipeline';
@@ -282,19 +283,23 @@ async function parseWithUnpdf(pdfBuffer: Buffer, textOnly = false): Promise<Pars
       for (let i = 0; i < pageImages.length; i++) {
         const imgData = pageImages[i];
         try {
-          // Use sharp to convert raw image data to PNG base64
-          const pngBuffer = await sharp(Buffer.from(imgData.data), {
-            raw: {
-              width: imgData.width,
-              height: imgData.height,
-              channels: imgData.channels,
-            },
-          })
-            .png()
-            .toBuffer();
+          // Compress to a budgeted JPEG; full-size PNG of every embedded image
+          // multiplies into hundreds of MB for image-heavy PDFs and overflows
+          // V8's max string length when the response is serialized.
+          const prepared = await preparePdfImage({
+            data: imgData.data,
+            width: imgData.width,
+            height: imgData.height,
+            channels: imgData.channels,
+          });
+          if (!prepared) {
+            log.warn(
+              `Skipping image ${i + 1} from page ${pageNum}: could not compress within budget`,
+            );
+            continue;
+          }
 
-          // Convert to base64
-          const base64 = `data:image/png;base64,${pngBuffer.toString('base64')}`;
+          const base64 = `data:${prepared.mime};base64,${prepared.buffer.toString('base64')}`;
           imageCounter++;
           const imgId = `img_${imageCounter}`;
           images.push(base64);
@@ -302,8 +307,8 @@ async function parseWithUnpdf(pdfBuffer: Buffer, textOnly = false): Promise<Pars
             id: imgId,
             src: base64,
             pageNumber: pageNum,
-            width: imgData.width,
-            height: imgData.height,
+            width: prepared.width,
+            height: prepared.height,
           });
         } catch (sharpError) {
           log.error(`Failed to convert image ${i + 1} from page ${pageNum}:`, sharpError);

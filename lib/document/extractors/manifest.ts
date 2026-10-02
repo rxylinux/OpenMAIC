@@ -76,7 +76,8 @@ const DOCUMENT_EXTRACTOR_MANIFEST: Record<string, DocumentExtractorManifestEntry
   unpdf: {
     id: 'unpdf',
     displayName: 'unpdf',
-    version: '1',
+    // v2: embedded images are downsampled to budgeted JPEG (was full-size PNG)
+    version: '2',
     supportedMimeTypes: [DOCUMENT_MIME_TYPES.pdf],
     capabilities: {
       text: true,

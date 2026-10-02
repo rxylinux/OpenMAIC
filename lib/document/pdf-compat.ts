@@ -1,3 +1,5 @@
+import { createLogger } from '@/lib/logger';
+import { MAX_PARSED_IMAGE_PAYLOAD_CHARS } from '@/lib/constants/generation';
 import type { ParsedPdfContent } from '@/lib/types/pdf';
 import type {
   DocumentArtifact,
@@ -5,6 +7,8 @@ import type {
   DocumentBlock,
   DocumentExtractorInput,
 } from './types';
+
+const log = createLogger('PdfCompat');
 
 function positionToBbox(position?: {
   x: number;
@@ -149,8 +153,28 @@ export function documentArtifactToParsedPdfContent(artifact: DocumentArtifact): 
     (asset): asset is DocumentAsset & { data: string } =>
       asset.type === 'image' && typeof asset.data === 'string',
   );
-  const images = imageAssets.map((asset) => asset.data as string);
-  const imageMapping = Object.fromEntries(imageAssets.map((asset) => [asset.id, asset.data]));
+  // Images ride the response exactly once (`metadata.pdfImages`); `images` and
+  // `imageMapping` stay empty. Re-emitting the same base64 in three fields
+  // tripled the serialized payload — for image-heavy PDFs the single response
+  // string grew past V8's max string length and JSON serialization threw.
+  // A cumulative budget drops trailing images beyond the cap so no provider's
+  // output can blow up the response again.
+  const budgetedImageAssets: Array<DocumentAsset & { data: string }> = [];
+  let imagePayloadChars = 0;
+  for (const asset of imageAssets) {
+    if (imagePayloadChars + asset.data.length > MAX_PARSED_IMAGE_PAYLOAD_CHARS) {
+      const dropped = imageAssets.length - budgetedImageAssets.length;
+      log.warn(
+        `Parsed-document image budget of ${MAX_PARSED_IMAGE_PAYLOAD_CHARS} chars reached; ` +
+          `dropping ${dropped} of ${imageAssets.length} images from the response`,
+      );
+      break;
+    }
+    imagePayloadChars += asset.data.length;
+    budgetedImageAssets.push(asset);
+  }
+  const images: string[] = [];
+  const imageMapping: Record<string, string> = {};
   const tables = artifact.blocks
     .filter((block) => block.type === 'table')
     .map((block) => ({
@@ -188,7 +212,7 @@ export function documentArtifactToParsedPdfContent(artifact: DocumentArtifact): 
       parser: rawMetadata?.parser,
       processingTime: artifact.metadata.processingTime ?? rawMetadata?.processingTime,
       imageMapping,
-      pdfImages: imageAssets.map((asset) => ({
+      pdfImages: budgetedImageAssets.map((asset) => ({
         id: asset.id,
         src: asset.data as string,
         pageNumber: asset.pageNumber ?? 0,

@@ -1,8 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { documentArtifactToParsedPdfContent, parsedPdfToDocumentArtifact } from '@/lib/document';
 import type { DocumentArtifact } from '@/lib/document';
+import type { DocumentAsset } from '@/lib/document/types';
 import type { ParsedPdfContent } from '@/lib/types/pdf';
+import { MAX_PARSED_IMAGE_PAYLOAD_CHARS } from '@/lib/constants/generation';
+
+vi.mock('@/lib/logger', () => ({
+  createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
+}));
 
 describe('PDF compatibility adapter', () => {
   it('normalizes parsed PDF output into a document artifact', () => {
@@ -155,13 +161,14 @@ describe('PDF compatibility adapter', () => {
     const roundTripped = documentArtifactToParsedPdfContent(artifact);
 
     expect(roundTripped.text).toBe('Artifact text');
-    expect(roundTripped.images).toEqual(['data:image/png;base64,abc']);
+    // Images ride the response exactly once: `images` and `imageMapping` stay
+    // empty — triplicating the base64 payload overflowed V8's max string
+    // length on image-heavy PDFs.
+    expect(roundTripped.images).toEqual([]);
     expect(roundTripped.metadata?.fileName).toBe('source.pdf');
     expect(roundTripped.metadata?.fileSize).toBe(456);
     expect(roundTripped.metadata?.pageCount).toBe(1);
-    expect(roundTripped.metadata?.imageMapping).toEqual({
-      img_1: 'data:image/png;base64,abc',
-    });
+    expect(roundTripped.metadata?.imageMapping).toEqual({});
     expect(roundTripped.metadata?.pdfImages).toEqual([
       { id: 'img_1', src: 'data:image/png;base64,abc', pageNumber: 1 },
     ]);
@@ -214,7 +221,7 @@ describe('PDF compatibility adapter', () => {
     const parsed = documentArtifactToParsedPdfContent(artifact);
 
     expect(parsed.text).toBe('Artifact markdown');
-    expect(parsed.images).toEqual(['data:image/png,raw']);
+    expect(parsed.images).toEqual([]);
     expect(parsed.tables).toEqual([
       { page: 2, data: [['Voltage', '12V']], caption: 'Measurements' },
     ]);
@@ -237,5 +244,33 @@ describe('PDF compatibility adapter', () => {
         height: undefined,
       },
     ]);
+  });
+
+  it('drops trailing images once the cumulative payload budget is exceeded', () => {
+    const perImageChars = 30_000_000; // two fit in the 64M-char budget, a third does not
+    const imageAsset = (id: string): DocumentAsset & { data: string } => ({
+      id,
+      type: 'image',
+      data: `data:image/jpeg;base64,${'a'.repeat(perImageChars)}`,
+      pageNumber: 1,
+    });
+    const artifact: DocumentArtifact = {
+      metadata: { fileName: 'huge.pdf', fileSize: 1, mimeType: 'application/pdf' },
+      blocks: [{ id: 'document-text', type: 'text', text: 'text' }],
+      assets: [imageAsset('img_1'), imageAsset('img_2'), imageAsset('img_3')],
+    };
+
+    const parsed = documentArtifactToParsedPdfContent(artifact);
+
+    expect(parsed.metadata?.pdfImages).toHaveLength(2);
+    expect(parsed.metadata?.pdfImages?.map((image) => image.id)).toEqual(['img_1', 'img_2']);
+    // The kept payload itself stays within the budget.
+    const totalChars = parsed.metadata!.pdfImages!.reduce(
+      (sum, image) => sum + image.src.length,
+      0,
+    );
+    expect(totalChars).toBeLessThanOrEqual(MAX_PARSED_IMAGE_PAYLOAD_CHARS);
+    expect(parsed.images).toEqual([]);
+    expect(parsed.metadata?.imageMapping).toEqual({});
   });
 });

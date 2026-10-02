@@ -14,3 +14,9 @@ export const MAX_VISION_IMAGES = 20;
 // resolution (`resolveVisionImagesForPrompt`) so an oversized asset is
 // rejected at `identify` — before any bytes are materialized.
 export const MAX_EXTRACT_DOCUMENT_FILE_SIZE_BYTES = 50 * 1024 * 1024;
+
+// Total base64 characters of image data one parsed-document response may
+// carry. The response JSON is built as a single string; without this cap an
+// image-heavy PDF (hundreds of embedded illustrations) overflows V8's max
+// string length (~536M chars) and the serialization throws RangeError.
+export const MAX_PARSED_IMAGE_PAYLOAD_CHARS = 64 * 1024 * 1024;

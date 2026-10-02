@@ -10,7 +10,12 @@ export interface ParsedPdfContent {
   /** Extracted text content from the PDF */
   text: string;
 
-  /** Array of images as base64 data URLs */
+  /**
+   * Array of images as base64 data URLs. Populated by provider parsers;
+   * API-response assembly (`documentArtifactToParsedPdfContent`) emits `[]`
+   * here and carries images once via `metadata.pdfImages` so the serialized
+   * payload stays within V8's string-length limit.
+   */
   images: string[];
 
   /** Extracted tables (MinerU feature) */
