@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   ArrowUp,
+  BookX,
   Check,
   ChevronDown,
   ChevronRight,
@@ -224,6 +225,24 @@ function HomePage() {
 
   const [themeOpen, setThemeOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Unmastered mistake count for the top-right pill badge; -1 hides the badge
+  // (not loaded yet, or the deployment has no server persistence for it).
+  const [mistakeCount, setMistakeCount] = useState(-1);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { fetchMistakes } = await import('@/lib/mistake-book/client');
+        const result = await fetchMistakes('unmastered');
+        if (!cancelled && result.configured) setMistakeCount(result.mistakes.length);
+      } catch {
+        /* hidden badge is the fallback */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   // True while the Generate click drains upload-time ingests and builds the
   // generation session. Doubles as the guard flag that freezes the course
   // material set for the duration of prep and as the switch that disables the
@@ -725,6 +744,23 @@ function HomePage() {
         ref={toolbarRef}
         className="fixed top-4 right-4 z-50 flex items-center gap-1 bg-white/60 dark:bg-gray-800/60 backdrop-blur-md px-2 py-1.5 rounded-full border border-gray-100/50 dark:border-gray-700/50 shadow-sm"
       >
+        {/* Mistake book entry */}
+        <button
+          onClick={() => router.push('/mistake-book')}
+          className="relative p-2 rounded-full text-gray-400 hover:text-violet-500 dark:text-gray-400 dark:hover:text-violet-300 hover:bg-gray-100 dark:hover:bg-gray-700/60 transition-colors group"
+          aria-label={t('mistakeBook.entry')}
+          title={t('mistakeBook.entry')}
+        >
+          <BookX className="w-4 h-4" />
+          {mistakeCount > 0 && (
+            <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[10px] leading-4 font-medium text-center">
+              {mistakeCount > 99 ? '99+' : mistakeCount}
+            </span>
+          )}
+        </button>
+
+        <div className="w-[1px] h-4 bg-gray-200 dark:bg-gray-700" />
+
         {/* Language Selector */}
         <LanguageSwitcher onOpen={() => setThemeOpen(false)} />
 

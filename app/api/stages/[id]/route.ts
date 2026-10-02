@@ -27,6 +27,8 @@ import { getOwnerScopedDocumentStore } from '@/lib/server/agent-runtime/owner-sc
 import { ownerApiError, ownerJson, ownerNotFound } from '@/lib/server/agent-runtime/route-response';
 import { withRequestOwnerId } from '@/lib/server/agent-runtime/with-owner';
 import { STAGE_NAME_MAX_LENGTH } from '@/lib/server/agent-runtime/stage-limits';
+import { omitUndefinedObjectMembers } from '@/lib/persistence/plain-json';
+import { normalizeCourseSubject, normalizeGradeSemester } from '@/lib/curriculum/taxonomy';
 
 export const runtime = 'nodejs';
 
@@ -74,7 +76,10 @@ export async function GET(req: NextRequest, { params }: Params) {
   });
 }
 
-// PATCH /api/stages/[id] — rename the course (owner-only).
+// PATCH /api/stages/[id] — rename the course, and/or set its curriculum
+// classification (owner-only). `name` keeps its legacy contract: when present
+// it must be a valid non-empty name. `subject`/`gradeSemester` are optional
+// closed-list codes; explicit null clears them.
 export async function PATCH(req: NextRequest, { params }: Params) {
   if (!isAgentRuntimeConfigured()) return new Response('Not found', { status: 404 });
 
@@ -84,17 +89,49 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   } catch {
     return apiError('INVALID_REQUEST', 400, 'invalid JSON body');
   }
-  const rawName = (body as { name?: unknown })?.name;
-  if (typeof rawName !== 'string' || rawName.trim().length === 0) {
-    return apiError('INVALID_REQUEST', 400, 'name must be a non-empty string');
+  const patch = body as {
+    name?: unknown;
+    subject?: unknown;
+    gradeSemester?: unknown;
+  };
+
+  let name: string | undefined;
+  if (patch.name !== undefined) {
+    if (typeof patch.name !== 'string' || patch.name.trim().length === 0) {
+      return apiError('INVALID_REQUEST', 400, 'name must be a non-empty string');
+    }
+    name = patch.name.trim();
+    if (name.length > STAGE_NAME_MAX_LENGTH) {
+      return apiError(
+        'INVALID_REQUEST',
+        400,
+        `name exceeds the ${STAGE_NAME_MAX_LENGTH} character limit`,
+      );
+    }
   }
-  const name = rawName.trim();
-  if (name.length > STAGE_NAME_MAX_LENGTH) {
-    return apiError(
-      'INVALID_REQUEST',
-      400,
-      `name exceeds the ${STAGE_NAME_MAX_LENGTH} character limit`,
-    );
+
+  // Curriculum codes: closed-list tokens or null (clear); anything else is a
+  // client bug, not a fallback case.
+  let subject: string | null | undefined;
+  if (patch.subject !== undefined) {
+    if (patch.subject === null) subject = null;
+    else {
+      const normalized = normalizeCourseSubject(patch.subject);
+      if (!normalized) return apiError('INVALID_REQUEST', 400, 'invalid subject code');
+      subject = normalized;
+    }
+  }
+  let gradeSemester: string | null | undefined;
+  if (patch.gradeSemester !== undefined) {
+    if (patch.gradeSemester === null) gradeSemester = null;
+    else {
+      const normalized = normalizeGradeSemester(patch.gradeSemester);
+      if (!normalized) return apiError('INVALID_REQUEST', 400, 'invalid gradeSemester code');
+      gradeSemester = normalized;
+    }
+  }
+  if (name === undefined && subject === undefined && gradeSemester === undefined) {
+    return apiError('INVALID_REQUEST', 400, 'nothing to update: name, subject or gradeSemester');
   }
 
   return withRequestOwnerId(req, async (ownerId, responseHeaders) => {
@@ -103,14 +140,20 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     const document = await store.loadDocument(id);
     if (!document) return ownerNotFound(responseHeaders);
     try {
-      await store.saveDocument({
-        ...document,
-        stage: { ...document.stage, name, updatedAt: Date.now() },
+      // A null classification clears the field: mapped to undefined so the
+      // plain-JSON writer drops the key entirely (the Stage type has no null).
+      const stage = omitUndefinedObjectMembers({
+        ...document.stage,
+        ...(name !== undefined ? { name } : {}),
+        ...(subject !== undefined ? { subject: subject ?? undefined } : {}),
+        ...(gradeSemester !== undefined ? { gradeSemester: gradeSemester ?? undefined } : {}),
+        updatedAt: Date.now(),
       });
+      await store.saveDocument({ ...document, stage });
     } catch (error) {
       return mapSaveError(error, responseHeaders);
     }
-    return ownerJson({ success: true, name }, 200, responseHeaders);
+    return ownerJson({ success: true }, 200, responseHeaders);
   });
 }
 

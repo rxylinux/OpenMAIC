@@ -18,6 +18,7 @@ import { cn } from '@/lib/utils';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { getCurrentModelConfig } from '@/lib/utils/model-config';
 import { createLogger } from '@/lib/logger';
+import { useStageStore } from '@/lib/store';
 
 const log = createLogger('QuizView');
 import type { QuizQuestion } from '@/lib/types/stage';
@@ -51,6 +52,9 @@ interface QuizViewProps {
   readonly questions: QuizQuestion[];
   readonly sceneId: string;
   readonly stageId: string;
+  /** Scene title/order for the mistake book's capture context (best effort). */
+  readonly sceneTitle?: string;
+  readonly sceneOrder?: number;
 }
 
 const QuizMathText = memo(function QuizMathText({
@@ -697,7 +701,7 @@ function ScoreBanner({
 
 // ─── Main Component ─────────────────────────────────────────────────────────
 
-export function QuizView({ questions, sceneId, stageId }: QuizViewProps) {
+export function QuizView({ questions, sceneId, stageId, sceneTitle, sceneOrder }: QuizViewProps) {
   const { t, locale } = useI18n();
 
   const [phase, setPhase] = useState<Phase>('not_started');
@@ -837,12 +841,42 @@ export function QuizView({ questions, sceneId, stageId }: QuizViewProps) {
       if (cancelled) return;
       setResults(ordered);
       setPhase('reviewing');
+
+      // Mistake book capture: fire-and-forget, never blocks the review flow.
+      const stage = useStageStore.getState().stage;
+      if (stage?.name) {
+        void (async () => {
+          const { buildMistakeCapturePayload, captureMistakesFromQuiz } =
+            await import('@/lib/mistake-book/client');
+          const payload = buildMistakeCapturePayload(questions, answers, ordered, {
+            stageId,
+            stageName: stage.name,
+            sceneId,
+            ...(sceneTitle ? { sceneTitle } : {}),
+            ...(sceneOrder !== undefined ? { sceneOrder } : {}),
+            ...(stage.subject ? { subject: stage.subject } : {}),
+            ...(stage.gradeSemester ? { gradeSemester: stage.gradeSemester } : {}),
+          });
+          if (payload) await captureMistakesFromQuiz(payload);
+        })();
+      }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [phase, questions, answers, locale, sceneId, stageId, attemptId, runtimeWriter]);
+  }, [
+    phase,
+    questions,
+    answers,
+    locale,
+    sceneId,
+    stageId,
+    attemptId,
+    runtimeWriter,
+    sceneTitle,
+    sceneOrder,
+  ]);
 
   const handleRetry = useCallback(async () => {
     if (!attemptId || retrying) return;

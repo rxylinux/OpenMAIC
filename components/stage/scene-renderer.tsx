@@ -31,6 +31,8 @@ export function SceneRenderer({ scene, mode }: SceneRendererProps) {
             questions={scene.content.questions}
             sceneId={scene.id}
             stageId={scene.stageId}
+            sceneTitle={scene.title}
+            sceneOrder={scene.order}
           />
         );
       case 'interactive':

@@ -532,7 +532,7 @@ export async function generateClassroom(
     throw new Error(outlinesResult.error || 'Failed to generate scene outlines');
   }
 
-  const { languageDirective, courseTitle, outlines } = outlinesResult.data;
+  const { languageDirective, courseTitle, subject, gradeSemester, outlines } = outlinesResult.data;
   log.info(
     `Generated ${outlines.length} scene outlines (languageDirective: ${languageDirective}, courseTitle: ${courseTitle ?? 'n/a'})`,
   );
@@ -567,6 +567,8 @@ export async function generateClassroom(
     name: courseTitle || outlines[0]?.title || requirement.slice(0, 50),
     description: undefined,
     languageDirective,
+    ...(subject ? { subject } : {}),
+    ...(gradeSemester ? { gradeSemester } : {}),
     videoManifest: buildVideoManifestFromOutlines(outlines),
     style: 'interactive',
     createdAt: Date.now(),

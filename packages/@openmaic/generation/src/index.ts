@@ -7,6 +7,14 @@ export type {
 } from './pipeline-types.js';
 
 export {
+  COURSE_SUBJECTS,
+  GRADE_SEMESTERS,
+  normalizeCourseSubject,
+  normalizeGradeSemester,
+} from './curriculum.js';
+export type { CourseSubject, GradeSemester } from './curriculum.js';
+
+export {
   extractInteractiveElements,
   extractWidgetConfig,
   generateSceneActions,

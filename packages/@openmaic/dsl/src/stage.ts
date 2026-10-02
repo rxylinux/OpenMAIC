@@ -147,6 +147,14 @@ export interface Stage {
   // Stage metadata
   languageDirective?: string;
   style?: string;
+  /**
+   * Curriculum taxonomy (RFC: mistake book). Machine codes from
+   * `lib/curriculum/taxonomy.ts` — 'math' etc. and 'grade-1-up' etc. —
+   * inferred by outline generation, editable on the stage. Optional and
+   * unknown to older documents; validators tolerate it.
+   */
+  subject?: string;
+  gradeSemester?: string;
   // Whiteboard data
   whiteboard?: Whiteboard[];
   // Generated video requests keyed by the mediaRef used by PPTVideoElement.

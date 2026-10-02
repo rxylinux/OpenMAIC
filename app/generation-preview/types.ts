@@ -38,6 +38,10 @@ export interface GenerationSessionState {
   languageDirective?: string;
   // Concise course title inferred from outline generation (used as the stage name)
   courseTitle?: string;
+  // Curriculum taxonomy codes inferred from outline generation (stored on the
+  // stage, consumed by the mistake book's subject → grade grouping).
+  subject?: string;
+  gradeSemester?: string;
   // Server-effective vocational mode from the outline generation done event.
   taskEngineMode?: boolean;
 }

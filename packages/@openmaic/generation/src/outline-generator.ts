@@ -6,6 +6,7 @@
 import { nanoid } from 'nanoid';
 import { MAX_PDF_CONTENT_CHARS, MAX_VISION_IMAGES } from './constants.js';
 import { parseJsonResponse } from './json-repair.js';
+import { normalizeCourseSubject, normalizeGradeSemester } from './curriculum.js';
 import { noopGenerationLogger, type GenerationLogger } from './logger.js';
 import {
   formatImageDescription,
@@ -124,7 +125,13 @@ export async function generateSceneOutlinesFromRequirements(
   aiCall: AICallFn,
   options?: OutlineGenerationOptions,
 ): Promise<
-  GenerationResult<{ languageDirective: string; courseTitle?: string; outlines: SceneOutline[] }>
+  GenerationResult<{
+    languageDirective: string;
+    courseTitle?: string;
+    subject?: string;
+    gradeSemester?: string;
+    outlines: SceneOutline[];
+  }>
 > {
   const logger = options?.logger ?? noopGenerationLogger;
   const context: OutlinePromptContext = { ...options, pdfText, pdfImages };
@@ -144,11 +151,20 @@ export async function generateSceneOutlinesFromRequirements(
   try {
     const response = await aiCall(prompts.system, prompts.user, visionImages);
     const parsed = parseJsonResponse<
-      { languageDirective: string; courseTitle?: string; outlines: SceneOutline[] } | SceneOutline[]
+      | {
+          languageDirective: string;
+          courseTitle?: string;
+          subject?: unknown;
+          gradeSemester?: unknown;
+          outlines: SceneOutline[];
+        }
+      | SceneOutline[]
     >(response, { logger });
 
     let languageDirective: string;
     let courseTitle: string | undefined;
+    let subject: string | undefined;
+    let gradeSemester: string | undefined;
     let rawOutlines: SceneOutline[];
 
     if (Array.isArray(parsed)) {
@@ -159,6 +175,11 @@ export async function generateSceneOutlinesFromRequirements(
       const rawTitle = parsed.courseTitle;
       courseTitle =
         typeof rawTitle === 'string' && rawTitle.trim() ? rawTitle.trim().slice(0, 120) : undefined;
+      // Closed-list normalization: a free-text or unknown value (older models,
+      // hand-edited output) collapses to undefined rather than forking the
+      // taxonomy the mistake book groups by.
+      subject = normalizeCourseSubject(parsed.subject) ?? undefined;
+      gradeSemester = normalizeGradeSemester(parsed.gradeSemester) ?? undefined;
       rawOutlines = parsed.outlines;
     } else {
       return { success: false, error: 'Failed to parse scene outlines response' };
@@ -179,7 +200,10 @@ export async function generateSceneOutlinesFromRequirements(
 
     const result = uniquifyMediaElementIds(enriched);
 
-    return { success: true, data: { languageDirective, courseTitle, outlines: result } };
+    return {
+      success: true,
+      data: { languageDirective, courseTitle, subject, gradeSemester, outlines: result },
+    };
   } catch (error) {
     return { success: false, error: String(error) };
   }

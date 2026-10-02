@@ -40,6 +40,7 @@ import { resolveModelFromRequest } from '@/lib/server/resolve-model';
 import { sortDocumentImagesForVision } from '@/lib/document/bundle';
 import { resolveVisionImagesForPrompt } from '@/lib/persistence/resolve-vision-images';
 import { resolveVocationalActive } from '@/lib/config/feature-flags';
+import { extractGradeSemesterCode, extractSubjectCode } from '@/lib/curriculum/extract';
 const log = createLogger('Outlines Stream');
 
 export const maxDuration = 300;
@@ -514,6 +515,8 @@ export async function POST(req: NextRequest) {
           let parsedOutlines: SceneOutline[] = [];
           let languageDirective: string | null = null;
           let courseTitle: string | null = null;
+          let subject: string | null = null;
+          let gradeSemester: string | null = null;
           let lastError: string | undefined;
 
           for (let attempt = 1; attempt <= MAX_STREAM_RETRIES + 1; attempt++) {
@@ -607,6 +610,11 @@ export async function POST(req: NextRequest) {
                   // recover it from the now-complete response before finalizing.
                   courseTitle = extractCourseTitleFromComplete(fullText);
                 }
+                // Curriculum taxonomy rides only the done event — no early
+                // stream event needed for two short metadata codes. Same
+                // full-buffer scan, same closed-list normalization.
+                subject = extractSubjectCode(fullText);
+                gradeSemester = extractGradeSemesterCode(fullText);
                 break;
               }
 
@@ -667,6 +675,8 @@ export async function POST(req: NextRequest) {
               outlines: uniquifiedOutlines,
               languageDirective: languageDirective || DEFAULT_LANGUAGE_DIRECTIVE,
               courseTitle: courseTitle || undefined,
+              subject: subject || undefined,
+              gradeSemester: gradeSemester || undefined,
               taskEngineMode,
             });
             controller.enqueue(encoder.encode(`data: ${doneEvent}\n\n`));

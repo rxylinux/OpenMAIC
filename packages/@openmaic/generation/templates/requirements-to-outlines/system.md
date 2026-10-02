@@ -232,12 +232,14 @@ Leave **both unset** for ordinary build-an-artefact PBL projects (this is the de
 
 ### Top-level shape — NON-NEGOTIABLE
 
-Your entire response MUST be a single JSON **object** with exactly these three top-level keys:
+Your entire response MUST be a single JSON **object** with exactly these five top-level keys:
 
 ```json
 {
   "languageDirective": "<the directive you inferred in the Language Inference step>",
   "courseTitle": "<concise course name, ≤30 chars, in the teaching language>",
+  "subject": "<subject code, see below>",
+  "gradeSemester": "<grade/semester code, see below>",
   "outlines": [ /* array of scene objects */ ]
 }
 ```
@@ -247,6 +249,19 @@ Rules:
 - **Never** return a bare array. The top level is an object, not an array.
 - **Never** omit `languageDirective` or `courseTitle`. Both are required even if you think they are obvious.
 - **Never** wrap the response in any other structure, prose, or code fence.
+
+#### Curriculum classification codes
+
+`subject` and `gradeSemester` classify the course for the learner's mistake
+book and course library. Infer them from the requirement and the attached
+document (a textbook's cover page and table of contents name the subject and
+grade almost always). Output EXACTLY one code from each closed list — never a
+free-text value, never a synonym, never localized text:
+
+- `subject`: `"chinese"`, `"math"`, `"english"`, `"science"`, `"other"`
+- `gradeSemester`: `"grade-1-up"` … `"grade-6-down"` (grades 1–6, `-up` = first
+  semester, `-down` = second semester; e.g. `"grade-3-up"` = 三年级上学期),
+  or `"other"` for anything outside primary school.
 
 ### Minimal complete example
 
@@ -371,7 +386,7 @@ Omit `scenarioRoleplay` and `scenarioBrief` entirely for ordinary build-an-artef
 **Top-level response shape (these come first because they are most often violated):**
 
 1. Return exactly one JSON **object** — never a bare array.
-2. That object MUST have `languageDirective` (string), `courseTitle` (string, ≤30 chars), and `outlines` (array) as top-level keys. Omitting any is a failure.
+2. That object MUST have `languageDirective` (string), `courseTitle` (string, ≤30 chars), `outlines` (array), `subject` (code from the closed list), and `gradeSemester` (code from the closed list) as top-level keys. Omitting any is a failure.
 3. Do not wrap the object in prose, markdown, or code fences.
 
 **Scene-level rules:**
@@ -384,3 +399,4 @@ Omit `scenarioRoleplay` and `scenarioBrief` entirely for ordinary build-an-artef
 9. **Language**: Infer from the user's requirement text and context. Output all scene content in the inferred language.
 10. Regardless of information completeness, always output conforming JSON - do not ask questions or request more information
 11. **No teacher identity on slides**: Scene titles and keyPoints must be neutral and topic-focused. Never include the teacher's name or role (e.g., avoid "Teacher Wang's Tips", "Teacher's Wishes"). Use generic labels like "Tips", "Summary", "Key Takeaways" instead.
+12. **After-class practice finale**: When the course plans 3 or more scenes and is not primarily a PBL course, the LAST outline MUST be a `quiz` scene that serves as the course's after-class practice — a wrap-up worksheet covering the key points of the WHOLE course (not just the last scene). Title it in the course language (e.g., 「课后练习」, "After-Class Practice"). Its `quizConfig` should ask for 5-8 questions, `difficulty` matching the course, and `questionTypes` covering `["single", "multiple", "short_answer"]` where the content allows. Skip this finale only when the user explicitly asked for no quizzes.

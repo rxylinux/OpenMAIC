@@ -547,6 +547,8 @@ function GenerationPreviewContent() {
       let outlines = currentSession.sceneOutlines;
       let languageDirective = currentSession.languageDirective;
       let courseTitle = currentSession.courseTitle;
+      let subject = currentSession.subject;
+      let gradeSemester = currentSession.gradeSemester;
 
       const outlineStepIdx = activeSteps.findIndex((s) => s.id === 'outline');
       setCurrentStepIndex(outlineStepIdx >= 0 ? outlineStepIdx : 0);
@@ -559,11 +561,15 @@ function GenerationPreviewContent() {
           outlines: SceneOutline[];
           languageDirective: string;
           courseTitle?: string;
+          subject?: string;
+          gradeSemester?: string;
           taskEngineMode: boolean;
         }>((resolve, reject) => {
           const collected: SceneOutline[] = [];
           let directive: string | undefined;
           let title: string | undefined;
+          let subject: string | undefined;
+          let gradeSemester: string | undefined;
 
           fetch('/api/generate/scene-outlines-stream', {
             method: 'POST',
@@ -631,6 +637,8 @@ function GenerationPreviewContent() {
                               directive ||
                               'Teach in the language that matches the user requirement.',
                             courseTitle: evt.courseTitle || title,
+                            subject: evt.subject || subject,
+                            gradeSemester: evt.gradeSemester || gradeSemester,
                             taskEngineMode: resolveTaskEngineModeFromOutlineDoneEvent(evt),
                           });
                           return;
@@ -654,6 +662,8 @@ function GenerationPreviewContent() {
                         // a stream that ends without an explicit `done` event
                         // does not silently drop a valid inferred title.
                         courseTitle: title,
+                        subject,
+                        gradeSemester,
                         taskEngineMode: false,
                       });
                     } else {
@@ -672,6 +682,8 @@ function GenerationPreviewContent() {
         outlines = outlineResult.outlines;
         languageDirective = outlineResult.languageDirective;
         courseTitle = outlineResult.courseTitle;
+        subject = outlineResult.subject;
+        gradeSemester = outlineResult.gradeSemester;
         const effectiveTaskEngineMode = outlineResult.taskEngineMode;
         setIsOutlineStreaming(false);
 
@@ -684,6 +696,8 @@ function GenerationPreviewContent() {
           sceneOutlines: outlines,
           languageDirective,
           courseTitle,
+          subject,
+          gradeSemester,
           taskEngineMode: effectiveTaskEngineMode,
           previewPhase: shouldReviewOutlines ? 'review' : 'outline-ready',
         };
@@ -730,6 +744,14 @@ function GenerationPreviewContent() {
       // replacing the raw-requirement placeholder set at stage creation time.
       if (courseTitle) {
         stage.name = courseTitle;
+      }
+
+      // Curriculum taxonomy for the mistake book's subject → grade grouping.
+      if (subject) {
+        stage.subject = subject;
+      }
+      if (gradeSemester) {
+        stage.gradeSemester = gradeSemester;
       }
 
       // ── Agent generation (after outlines — uses languageDirective + outlines) ──
