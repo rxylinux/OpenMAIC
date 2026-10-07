@@ -32,8 +32,10 @@ import type {
   RuntimeSessionInit,
   RuntimeStore,
   RuntimeTailOptions,
+  RuntimeStatusIfLatestOptions,
 } from './types.js';
 import { RuntimeAppendConflictError } from './types.js';
+import { isAdoptableQuizAttemptPayload } from './quiz-relevance.js';
 
 const SESSIONS = 'sessions';
 const RECORDS = 'records';
@@ -346,6 +348,97 @@ export class BrowserRuntimeStore implements RuntimeStore {
     });
   }
 
+  async setSessionStatusIfLatest(
+    sessionId: string,
+    status: RuntimeSessionStatus,
+    updatedAt: string,
+    options: RuntimeStatusIfLatestOptions = {},
+  ): Promise<boolean> {
+    const expectedLastSeq = options.expectedLastSeq;
+    const relevantSceneId = options.relevantSceneId;
+    if (
+      expectedLastSeq !== undefined &&
+      expectedLastSeq !== null &&
+      (!Number.isSafeInteger(expectedLastSeq) || expectedLastSeq < 0)
+    ) {
+      throw new Error('@openmaic/storage: expectedLastSeq must be null or a non-negative integer');
+    }
+    if (relevantSceneId !== undefined && typeof relevantSceneId !== 'string') {
+      throw new Error('@openmaic/storage: relevantSceneId must be a string when provided');
+    }
+
+    return await this.txRun([SESSIONS, RECORDS], 'readwrite', async (tx) => {
+      const sessions = tx.objectStore(SESSIONS);
+      const records = tx.objectStore(RECORDS);
+      const row = await reqP<RuntimeSession | undefined>(sessions.get(sessionId));
+      if (!row) {
+        throw new Error(`@openmaic/storage: no session ${JSON.stringify(sessionId)}`);
+      }
+      if (isFutureRuntimeVersioned(row)) throw futureSessionError(sessionId, row);
+      // Lineage precondition INSIDE the write transaction. RELEVANCE mirrors
+      // the canonical quiz reader, not "any anchored record": with
+      // `relevantSceneId`, a strictly newer same-kind sibling blocks only when
+      // the reader would ADOPT it — the sibling's envelope must survive the
+      // same migrate+validate gate listSessions applies (corrupt envelopes are
+      // omitted, never blockers) and its LATEST scene-filtered record must be
+      // a valid quiz payload. Newer empty sessions, malformed-tail sessions
+      // (even over a valid older draft), and other-scene quizzes never block a
+      // legitimate repair. Without the anchor, any strictly newer same-kind
+      // sibling blocks (the conservative generic form). IndexedDB readwrite
+      // transactions over these two stores serialize against appendRecord's,
+      // so the whole check+write is one atomic unit against every relevance
+      // change in this backend.
+      const siblings = await reqP<RuntimeSession[]>(
+        sessions.index(SESSIONS_BY_STAGE_LEARNER).getAll([row.stageId, row.learnerKey]),
+      );
+      for (const sibling of siblings) {
+        // Strictly-newer on the RAW row (the generic form deliberately stays
+        // conservative: even a corrupt-envelope sibling blocks it).
+        const strictlyNewer =
+          sibling.kind === row.kind &&
+          (Date.parse(sibling.createdAt) - Date.parse(row.createdAt) ||
+            sibling.id.localeCompare(row.id)) > 0;
+        if (!strictlyNewer) continue;
+        if (relevantSceneId === undefined) return false;
+        // Anchored form only: envelope gate identical to listSessions — a
+        // corrupt sibling row is OMITTED by the canonical reader and never
+        // blocks this scene's repair.
+        let validated: RuntimeSession;
+        try {
+          validated = migrateSession(sibling);
+          assertValid(
+            validateRuntimeSession(validated),
+            `stored runtime session ${JSON.stringify(validated.id)}`,
+          );
+        } catch {
+          continue;
+        }
+        const siblingRecords = await reqP<RuntimeRecord[]>(
+          records.getAll(sessionRecordRange(validated.id)),
+        );
+        // The getAll range is seq-ordered: filter to the repaired scene and
+        // take the LAST one — exactly the record listRecords(sceneId).at(-1)
+        // the reader adopts. A malformed tail (even over a valid older draft)
+        // makes the reader SKIP this sibling, so it must not block here.
+        const sceneRecords = siblingRecords.filter((record) => record.sceneId === relevantSceneId);
+        const latest = sceneRecords[sceneRecords.length - 1];
+        if (latest !== undefined && isAdoptableQuizAttemptPayload(latest.payload)) {
+          return false; // the reader adopts this newer sibling: refuse
+        }
+      }
+      const updated: RuntimeSession = { ...migrateSession(row), status, updatedAt };
+      assertValid(validateRuntimeSession(updated), `runtime session ${JSON.stringify(sessionId)}`);
+      if (expectedLastSeq !== undefined) {
+        const last = await reqP(records.openKeyCursor(sessionRecordRange(sessionId), 'prev'));
+        const actualLastSeq = last ? (last.primaryKey as [string, number])[1] : null;
+        if (expectedLastSeq !== actualLastSeq) {
+          throw new RuntimeAppendConflictError(sessionId, expectedLastSeq, actualLastSeq);
+        }
+      }
+      sessions.put(updated);
+      return true;
+    });
+  }
   async appendRecord<TPayload extends RuntimePayload>(
     init: RuntimeRecordInit<TPayload>,
     options: RuntimeAppendOptions = {},

@@ -67,6 +67,32 @@ const SceneParams = Type.Object({
         'Interactive pages only: widget configuration object matching widgetType (e.g. { concept, keyVariables } for simulation, { diagramType, nodes } for diagram, { language } for code, { gameType, challenge } for game, { visualizationType, objects } for visualization3d). Must be a plain object. Defaults to { concept: title } when widgetType is set; when only widgetOutline is set, widgetType defaults to simulation.',
     }),
   ),
+  quizConfig: Type.Optional(
+    Type.Object({
+      questionCount: Type.Integer({
+        minimum: 1,
+        maximum: 12,
+        description: 'How many questions to generate; use 5-8 for an after-class practice finale.',
+      }),
+      difficulty: Type.Union([Type.Literal('easy'), Type.Literal('medium'), Type.Literal('hard')], {
+        description: 'easy = recall, medium = understanding, hard = synthesis.',
+      }),
+      questionTypes: Type.Array(
+        Type.Union([
+          Type.Literal('single'),
+          Type.Literal('multiple'),
+          Type.Literal('text'),
+          Type.Literal('short_answer'),
+        ]),
+        {
+          minItems: 1,
+          uniqueItems: true,
+          description:
+            'Question types to mix; "text" and "short_answer" both mean written-answer questions.',
+        },
+      ),
+    }),
+  ),
   brief: Type.String({ minLength: 1 }),
   instruction: Type.Optional(Type.String()),
   materialFacts: Type.Optional(Type.Array(Type.String())),
@@ -261,7 +287,7 @@ export function buildGenerationTools(deps: GenerationToolDeps): AgentTool<never,
     name: 'generate_scene',
     label: 'Generate page',
     description:
-      'Generate and durably persist one page from an explicit title, type, and brief. Reusing an order replaces that page. Interactive pages accept widgetType (simulation/diagram/code/game/visualization3d) plus a matching widgetOutline object; both are rejected for other page types.',
+      'Generate and durably persist one page from an explicit title, type, and brief. Reusing an order replaces that page. Interactive pages accept widgetType (simulation/diagram/code/game/visualization3d) plus a matching widgetOutline object; both are rejected for other page types. Quiz pages accept quizConfig (questionCount, difficulty, questionTypes of single/multiple/text) instead; without it a quiz falls back to 3 medium single-choice questions. When generating the course-final after-class practice page, ask for 5-8 mixed-type questions covering the key points of the whole course.',
     parameters: SceneParams,
     async execute(_callId, params, signal) {
       if (!Number.isInteger(params.order) || params.order < 1) {
@@ -330,6 +356,13 @@ export function buildGenerationTools(deps: GenerationToolDeps): AgentTool<never,
           true,
         );
       }
+      if (params.type !== 'quiz' && params.quizConfig !== undefined) {
+        return result(
+          'generate_scene only accepts quizConfig for quiz pages.',
+          { error: 'quiz-config-requires-quiz', type: params.type },
+          true,
+        );
+      }
       const requestedMedia = params.media ?? [];
       if (requestedMedia.length > MAX_GENERATE_SCENE_MEDIA) {
         return result(
@@ -363,6 +396,19 @@ export function buildGenerationTools(deps: GenerationToolDeps): AgentTool<never,
                 projectTopic: params.title.trim(),
                 projectDescription: params.brief.trim(),
                 targetSkills: params.materialFacts ?? [],
+              },
+            }
+          : {}),
+        ...(params.type === 'quiz' && params.quizConfig
+          ? {
+              quizConfig: {
+                questionCount: params.quizConfig.questionCount,
+                difficulty: params.quizConfig.difficulty,
+                // "short_answer" is the outline-prompt spelling of a written-answer
+                // question; SceneOutline declares it as "text".
+                questionTypes: params.quizConfig.questionTypes.map((questionType) =>
+                  questionType === 'short_answer' ? 'text' : questionType,
+                ),
               },
             }
           : {}),

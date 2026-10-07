@@ -18,8 +18,8 @@ import { getServerPersistenceProvider } from '@/lib/persistence/server-provider'
 import type { ConnectableQueryable } from '@openmaic/storage/server/reference';
 import {
   MISTAKE_QUESTION_TYPES,
+  applyStageClassification,
   captureMistakes,
-  classifyStageMistakes,
   deleteAllMistakes,
   deleteMistake,
   deleteStageMistakes,
@@ -43,15 +43,30 @@ const LIST_FILTERS: readonly MistakeListFilter[] = ['all', 'unmastered', 'master
 
 interface CaptureItemBody {
   questionId?: unknown;
+  /** Stable per-question event id (R9); absent = legacy non-idempotent capture. */
+  eventId?: unknown;
   questionType?: unknown;
   question?: unknown;
   options?: unknown;
   correctAnswer?: unknown;
   analysis?: unknown;
+  knowledgePoint?: unknown;
   userAnswer?: unknown;
 }
 
 interface CaptureBody {
+  /**
+   * Legacy single-event id for one-item payloads (applied to that item).
+   * Per-item eventIds in items[] take precedence; validated identically.
+   */
+  eventId?: unknown;
+  /**
+   * Expected-owner guard (R8): the server owner id the client observed when
+   * the event was created. When present and it does not match the request's
+   * actual owner, the write is refused (409) — an identity switch between
+   * confirmation and POST can never pollute the new owner's data.
+   */
+  expectedOwnerId?: unknown;
   stageId?: unknown;
   stageName?: unknown;
   sceneId?: unknown;
@@ -74,12 +89,24 @@ interface KeyBody {
   gradeSemester?: unknown;
 }
 
-/** Static message: owner-scoped responses never echo caller-controlled input. */
-const NOT_CONFIGURED = apiError(
-  'INTERNAL_ERROR',
-  503,
-  'The mistake book requires server persistence; this deployment has none.',
-);
+/**
+ * Unconfigured-deployment gate (R10): a blank/absent DATABASE_URL answers
+ * 503 BEFORE any provider resolution — no pool is created, no network is
+ * touched. Fresh per call: a shared mutable Response would leak one owner's
+ * minted Set-Cookie into every other owner's response.
+ */
+function notConfiguredResponse(): NextResponse {
+  return apiError(
+    'INTERNAL_ERROR',
+    503,
+    'The mistake book requires server persistence; this deployment has none.',
+  );
+}
+
+/** True when the deployment carries a non-blank DATABASE_URL. */
+function databaseConfigured(): boolean {
+  return Boolean(process.env.DATABASE_URL?.trim());
+}
 
 function isIdString(value: unknown, max = MAX_ID_CHARS): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max;
@@ -98,6 +125,9 @@ function parseCaptureBody(body: CaptureBody):
       items: MistakeCaptureItem[];
     }
   | { ok: false; error: NextResponse } {
+  if (body.eventId !== undefined && !isIdString(body.eventId, 256)) {
+    return { ok: false, error: apiError('INVALID_REQUEST', 400, 'Invalid capture request body') };
+  }
   if (!isIdString(body.stageId)) {
     return { ok: false, error: apiError('INVALID_REQUEST', 400, 'Invalid capture request body') };
   }
@@ -144,6 +174,9 @@ function parseCaptureBody(body: CaptureBody):
     if (!isIdString(raw.questionId)) {
       return { ok: false, error: apiError('INVALID_REQUEST', 400, 'Invalid capture request body') };
     }
+    if (raw.eventId !== undefined && !isIdString(raw.eventId, 256)) {
+      return { ok: false, error: apiError('INVALID_REQUEST', 400, 'Invalid capture request body') };
+    }
     if (
       typeof raw.questionType !== 'string' ||
       !MISTAKE_QUESTION_TYPES.includes(raw.questionType as never)
@@ -163,6 +196,14 @@ function parseCaptureBody(body: CaptureBody):
     ) {
       return { ok: false, error: apiError('INVALID_REQUEST', 400, 'Invalid capture request body') };
     }
+    if (
+      raw.knowledgePoint !== undefined &&
+      (typeof raw.knowledgePoint !== 'string' || raw.knowledgePoint.length > MAX_TITLE_CHARS)
+    ) {
+      // Same short-string ceiling as titles: a knowledge point is a phrase,
+      // not a paragraph.
+      return { ok: false, error: apiError('INVALID_REQUEST', 400, 'Invalid capture request body') };
+    }
     if (raw.userAnswer === undefined) {
       return { ok: false, error: apiError('INVALID_REQUEST', 400, 'Invalid capture request body') };
     }
@@ -170,9 +211,13 @@ function parseCaptureBody(body: CaptureBody):
       questionId: raw.questionId,
       questionType: raw.questionType as MistakeCaptureItem['questionType'],
       question: raw.question,
+      ...(raw.eventId !== undefined ? { eventId: raw.eventId } : {}),
       ...(raw.options !== undefined ? { options: raw.options } : {}),
       ...(raw.correctAnswer !== undefined ? { correctAnswer: raw.correctAnswer } : {}),
       ...(raw.analysis !== undefined ? { analysis: raw.analysis } : {}),
+      ...(raw.knowledgePoint !== undefined && raw.knowledgePoint !== ''
+        ? { knowledgePoint: raw.knowledgePoint }
+        : {}),
       userAnswer: raw.userAnswer,
     });
   }
@@ -195,22 +240,59 @@ function parseCaptureBody(body: CaptureBody):
 }
 
 /** Propagate the owner-identity headers the owner wrapper may have set. */
-function withOwnerHeaders(response: NextResponse, headers: Headers): NextResponse {
+function withOwnerHeaders(
+  response: NextResponse,
+  headers: Headers,
+  ownerId?: string,
+): NextResponse {
   for (const [key, value] of headers.entries()) {
     if (!response.headers.has(key)) response.headers.set(key, value);
   }
+  // No-secret owner echo: lets the browser-side outbox bind queued events to
+  // the SERVER identity (the HttpOnly cookie itself is unreadable there).
+  if (ownerId) response.headers.set('x-owner-id', ownerId);
   return response;
 }
 
 async function resolveQueryable(): Promise<ConnectableQueryable | null> {
-  const provider = await getServerPersistenceProvider(process.env.DATABASE_URL ?? '');
+  if (!databaseConfigured()) return null; // never initialize a pool when unset
+  const provider = await getServerPersistenceProvider(process.env.DATABASE_URL!);
   return provider ? (provider.pool as unknown as ConnectableQueryable) : null;
+}
+async function captureAndRespond(
+  queryable: ConnectableQueryable,
+  ownerId: string,
+  parsed: Extract<ReturnType<typeof parseCaptureBody>, { ok: true }>,
+  topLevelEventId?: string,
+) {
+  // REAL event-contract pass-through (R9): item-level ids win; a legacy
+  // top-level eventId applies to a SINGLE-item payload only; anything else is
+  // a legacy non-idempotent capture (undefined per item).
+  // PER-ITEM event ids (delivery addendum): a batch with mixed tagged and
+  // legacy items keeps each item's own contract — a tagged item NEVER loses
+  // its id because a sibling lacks one. Only a single-item payload may fall
+  // back to the legacy top-level id; truly untagged items stay undefined
+  // (legacy, non-idempotent).
+  const eventIds = parsed.items.map((item, index) => {
+    if ('eventId' in item) return (item as { eventId: string }).eventId;
+    if (parsed.items.length === 1 && index === 0 && topLevelEventId) return topLevelEventId;
+    return undefined;
+  });
+  const receipt = await captureMistakes(queryable, ownerId, parsed, parsed.items, { eventIds });
+  return apiSuccess({
+    data: {
+      captured: receipt.created.length + receipt.counted.length,
+      created: receipt.created,
+      counted: receipt.counted,
+      duplicates: receipt.duplicates,
+    },
+  });
 }
 
 export async function POST(req: NextRequest) {
   return withRequestOwnerId(req, async (ownerId, responseHeaders) => {
     const queryable = await resolveQueryable();
-    if (!queryable) return withOwnerHeaders(NOT_CONFIGURED, responseHeaders);
+    if (!queryable) return withOwnerHeaders(notConfiguredResponse(), responseHeaders, ownerId);
 
     let body: CaptureBody;
     try {
@@ -229,22 +311,68 @@ export async function POST(req: NextRequest) {
     }
 
     const parsed = parseCaptureBody(body);
-    if (!parsed.ok) return withOwnerHeaders(parsed.error, responseHeaders);
+    if (!parsed.ok) return withOwnerHeaders(parsed.error, responseHeaders, ownerId);
 
-    await captureMistakes(queryable, ownerId, parsed, parsed.items);
-    return withOwnerHeaders(
-      apiSuccess({ data: { captured: parsed.items.length } }),
-      responseHeaders,
-    );
+    // Expected-owner defense (R8): fail closed BEFORE any write when the
+    // client's confirmed identity no longer matches the request identity.
+    if (typeof body.expectedOwnerId === 'string' && body.expectedOwnerId !== ownerId) {
+      // Owner-mismatch is an IDENTITY refusal (recoverable when the creator
+      // identity returns) — deliberately a different code from the permanent
+      // event-payload conflict below.
+      return withOwnerHeaders(
+        apiError('OWNER_MISMATCH', 409, 'Owner identity changed; event not attributed'),
+        responseHeaders,
+        ownerId,
+      );
+    }
+    try {
+      return withOwnerHeaders(
+        await captureAndRespond(queryable, ownerId, parsed, body.eventId as string | undefined),
+        responseHeaders,
+        ownerId,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message === 'EVENT_PAYLOAD_CONFLICT') {
+        return withOwnerHeaders(
+          apiError(
+            'EVENT_PAYLOAD_CONFLICT',
+            409,
+            'Event id already recorded with different content',
+          ),
+          responseHeaders,
+        );
+      }
+      if (message === 'DUPLICATE_EVENT_ID_IN_BATCH' || message === 'DUPLICATE_QUESTION_IN_BATCH') {
+        return withOwnerHeaders(
+          apiError('INVALID_REQUEST', 400, 'Duplicate question/event within one capture batch'),
+          responseHeaders,
+        );
+      }
+      throw error;
+    }
   });
 }
 
 export async function GET(req: NextRequest) {
   return withRequestOwnerId(req, async (ownerId, responseHeaders) => {
     const queryable = await resolveQueryable();
-    if (!queryable) return withOwnerHeaders(NOT_CONFIGURED, responseHeaders);
+    if (!queryable) return withOwnerHeaders(notConfiguredResponse(), responseHeaders, ownerId);
 
     const params = new URL(req.url).searchParams;
+
+    // Lightweight badge count (R11): unmastered rows only, no row payloads.
+    if (params.get('count')) {
+      const result = await queryable.query<{ n: number } & Record<string, unknown>>(
+        'SELECT count(*)::int AS n FROM mistake_record WHERE owner_id = $1 AND mastered_at IS NULL',
+        [ownerId],
+      );
+      return withOwnerHeaders(
+        apiSuccess({ data: { count: result.rows[0]?.n ?? 0 } }),
+        responseHeaders,
+        ownerId,
+      );
+    }
     const filterParam = params.get('filter') ?? 'all';
     const filter = LIST_FILTERS.includes(filterParam as MistakeListFilter)
       ? (filterParam as MistakeListFilter)
@@ -268,7 +396,7 @@ export async function GET(req: NextRequest) {
 export async function PATCH(req: NextRequest) {
   return withRequestOwnerId(req, async (ownerId, responseHeaders) => {
     const queryable = await resolveQueryable();
-    if (!queryable) return withOwnerHeaders(NOT_CONFIGURED, responseHeaders);
+    if (!queryable) return withOwnerHeaders(notConfiguredResponse(), responseHeaders, ownerId);
 
     let body: KeyBody;
     try {
@@ -286,9 +414,11 @@ export async function PATCH(req: NextRequest) {
       );
     }
 
-    // Variant: bulk curriculum classification of one stage's mistakes.
-    // { classifyStage: true, stageId, subject?, gradeSemester? } — the caller
-    // also PATCHes the stage metadata itself, so future captures agree.
+    // Variant: the single server-side classification command for one stage.
+    // Tri-state per field: omitted = keep, null = clear, valid code = set.
+    // Requires only server persistence (never the agent runtime); the course
+    // metadata join happens inside the same command when the course exists,
+    // belongs to this owner, and is alive.
     if (body.classifyStage === true) {
       if (!isIdString(body.stageId)) {
         return withOwnerHeaders(
@@ -296,11 +426,15 @@ export async function PATCH(req: NextRequest) {
           responseHeaders,
         );
       }
-      if (
-        body.subject !== undefined &&
-        body.subject !== null &&
-        normalizeCourseSubject(body.subject) === null
-      ) {
+      const subject =
+        body.subject === undefined || body.subject === null
+          ? body.subject
+          : normalizeCourseSubject(body.subject);
+      const gradeSemester =
+        body.gradeSemester === undefined || body.gradeSemester === null
+          ? body.gradeSemester
+          : normalizeGradeSemester(body.gradeSemester);
+      if (body.subject !== undefined && body.subject !== null && subject === null) {
         return withOwnerHeaders(
           apiError('INVALID_REQUEST', 400, 'Invalid request body'),
           responseHeaders,
@@ -309,27 +443,47 @@ export async function PATCH(req: NextRequest) {
       if (
         body.gradeSemester !== undefined &&
         body.gradeSemester !== null &&
-        normalizeGradeSemester(body.gradeSemester) === null
+        gradeSemester === null
       ) {
         return withOwnerHeaders(
           apiError('INVALID_REQUEST', 400, 'Invalid request body'),
           responseHeaders,
         );
       }
-      const updated = await classifyStageMistakes(queryable, ownerId, body.stageId, {
-        ...(body.subject !== undefined
-          ? { subject: body.subject === null ? undefined : normalizeCourseSubject(body.subject)! }
-          : {}),
-        ...(body.gradeSemester !== undefined
-          ? {
-              gradeSemester:
-                body.gradeSemester === null
-                  ? undefined
-                  : normalizeGradeSemester(body.gradeSemester)!,
-            }
-          : {}),
-      });
-      return withOwnerHeaders(apiSuccess({ data: { classified: updated } }), responseHeaders);
+      if (body.subject === undefined && body.gradeSemester === undefined) {
+        return withOwnerHeaders(
+          apiError('INVALID_REQUEST', 400, 'Invalid request body'),
+          responseHeaders,
+        );
+      }
+
+      const outcome = await applyStageClassification(
+        queryable,
+        { ownerId, stageId: body.stageId },
+        {
+          ...(subject === undefined ? {} : { subject }),
+          ...(gradeSemester === undefined ? {} : { gradeSemester }),
+        },
+      );
+      if (!outcome.matched) {
+        return withOwnerHeaders(
+          apiError('ASSET_NOT_FOUND', 404, 'No mistakes or course to classify for this stage'),
+          responseHeaders,
+        );
+      }
+      return withOwnerHeaders(
+        apiSuccess({
+          data: {
+            classified: outcome.mistakeRows,
+            courseUpdated: outcome.courseUpdated,
+            classification: {
+              subject: outcome.classification?.subject ?? null,
+              gradeSemester: outcome.classification?.gradeSemester ?? null,
+            },
+          },
+        }),
+        responseHeaders,
+      );
     }
 
     if (
@@ -351,16 +505,20 @@ export async function PATCH(req: NextRequest) {
       body.mastered,
     );
     if (!updated) {
-      return withOwnerHeaders(apiError('ASSET_NOT_FOUND', 404, 'No such mistake'), responseHeaders);
+      return withOwnerHeaders(
+        apiError('ASSET_NOT_FOUND', 404, 'No such mistake'),
+        responseHeaders,
+        ownerId,
+      );
     }
-    return withOwnerHeaders(apiSuccess({ data: { updated: true } }), responseHeaders);
+    return withOwnerHeaders(apiSuccess({ data: { updated: true } }), responseHeaders, ownerId);
   });
 }
 
 export async function DELETE(req: NextRequest) {
   return withRequestOwnerId(req, async (ownerId, responseHeaders) => {
     const queryable = await resolveQueryable();
-    if (!queryable) return withOwnerHeaders(NOT_CONFIGURED, responseHeaders);
+    if (!queryable) return withOwnerHeaders(notConfiguredResponse(), responseHeaders, ownerId);
 
     let body: KeyBody;
     try {
@@ -381,11 +539,11 @@ export async function DELETE(req: NextRequest) {
     // Three mutually exclusive scopes: one row, one stage, everything.
     if (body.all === true) {
       const deleted = await deleteAllMistakes(queryable, ownerId);
-      return withOwnerHeaders(apiSuccess({ data: { deleted } }), responseHeaders);
+      return withOwnerHeaders(apiSuccess({ data: { deleted } }), responseHeaders, ownerId);
     }
     if (isIdString(body.stageId) && body.sceneId === undefined && body.questionId === undefined) {
       const deleted = await deleteStageMistakes(queryable, ownerId, body.stageId);
-      return withOwnerHeaders(apiSuccess({ data: { deleted } }), responseHeaders);
+      return withOwnerHeaders(apiSuccess({ data: { deleted } }), responseHeaders, ownerId);
     }
     if (isIdString(body.stageId) && isIdString(body.sceneId) && isIdString(body.questionId)) {
       const removed = await deleteMistake(queryable, ownerId, {
@@ -399,7 +557,7 @@ export async function DELETE(req: NextRequest) {
           responseHeaders,
         );
       }
-      return withOwnerHeaders(apiSuccess({ data: { deleted: 1 } }), responseHeaders);
+      return withOwnerHeaders(apiSuccess({ data: { deleted: 1 } }), responseHeaders, ownerId);
     }
     return withOwnerHeaders(
       apiError('INVALID_REQUEST', 400, 'Invalid request body'),

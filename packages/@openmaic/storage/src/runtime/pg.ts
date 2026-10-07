@@ -30,6 +30,7 @@ import type {
 } from '@openmaic/dsl';
 import type {
   RuntimeAppendOptions,
+  RuntimeStatusIfLatestOptions,
   RuntimePayloadValidator,
   RuntimeSessionInit,
   RuntimeStore,
@@ -37,6 +38,7 @@ import type {
 } from './types.js';
 import { RuntimeAppendConflictError } from './types.js';
 import { assertJsonValue, isLosslessJsonString } from './json-value.js';
+import { isAdoptableQuizAttemptPayload } from './quiz-relevance.js';
 import { encodeJson } from '../pg-json.js';
 
 export interface QueryResult<TRow extends Record<string, unknown> = Record<string, unknown>> {
@@ -261,6 +263,41 @@ function isRetryableAppendError(error: unknown): boolean {
   return code === '23505' || code === '40001' || code === '40P01';
 }
 
+/**
+ * Xact-scoped advisory lock over one (stage, learner, kind) partition — the
+ * REAL shared serialization boundary for every operation that changes the
+ * partition's relevance/canonical-lineage FACTS: session creation
+ * (`createSession`), record appends (`appendRecord`), the lineage guard
+ * itself (`setSessionStatusIfLatest`), and partition membership moves
+ * (`mergeLearner`, which takes the DESTINATION partitions after locking its
+ * rows). READ COMMITTED row locks cannot exclude any of these; they all
+ * share this lock with one ordering — target row lock first, then the
+ * partition lock (merge: all rows ordered by id, then partition locks in a
+ * deterministic sorted order). Status-only writes (`setSessionStatus`)
+ * change no relevance fact, and deletes only ever REMOVE relevance (the
+ * guard may over-refuse, never unsafe-activate), so neither joins the
+ * boundary.
+ *
+ * Partition encoding: the three ids are joined with U+001F (UNIT SEPARATOR,
+ * a non-NUL control character PostgreSQL text parameters accept). The
+ * encoding is canonical but not injective — an id legitimately CONTAINING
+ * U+001F could alias another partition's key. Aliasing can only
+ * OVER-serialize distinct partitions (two partitions sharing one advisory
+ * lock), which is safe: it never lets a relevance-changing operation skip
+ * the boundary. Partition tuples are therefore never parsed back out of the
+ * joined key (see mergeLearner).
+ */
+async function acquirePartitionLock(
+  queryable: Queryable,
+  stageId: string,
+  learnerKey: string,
+  kind: string,
+): Promise<void> {
+  await queryable.query('SELECT pg_advisory_xact_lock(hashtext($1::text)::bigint)', [
+    `${stageId}\u001f${learnerKey}\u001f${kind}`,
+  ]);
+}
+
 export class PgRuntimeStore implements RuntimeStore {
   private readonly queryable: Queryable;
   private readonly transactionHook: WithTransaction;
@@ -339,30 +376,38 @@ export class PgRuntimeStore implements RuntimeStore {
     assertValid(validateRuntimeSession(stamped), `runtime session ${JSON.stringify(stamped.id)}`);
     assertJsonValue(stamped, `runtime session ${JSON.stringify(stamped.id)}`);
 
-    try {
-      await this.queryable.query(
-        `INSERT INTO runtime_sessions
-           (id, stage_id, learner_key, kind, status, created_at, updated_at, data)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
-        [
-          stamped.id,
-          stamped.stageId,
-          stamped.learnerKey,
-          stamped.kind,
-          stamped.status,
-          stamped.createdAt,
-          stamped.updatedAt,
-          encodeJson(stamped, `runtime session ${JSON.stringify(stamped.id)}`),
-        ],
-      );
-    } catch (error) {
-      if (isUniqueViolation(error)) {
-        throw new Error(`@openmaic/storage: session ${JSON.stringify(stamped.id)} already exists`, {
-          cause: error,
-        });
+    // Partition advisory lock (lineage-guard serialization): creating a
+    // session and evaluating setSessionStatusIfLatest share this xact-scoped
+    // lock, so a concurrent creation cannot commit between the guard's
+    // sibling check and its write under READ COMMITTED.
+    await this.transaction(async (queryable) => {
+      await acquirePartitionLock(queryable, stamped.stageId, stamped.learnerKey, stamped.kind);
+      try {
+        await queryable.query(
+          `INSERT INTO runtime_sessions
+             (id, stage_id, learner_key, kind, status, created_at, updated_at, data)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+          [
+            stamped.id,
+            stamped.stageId,
+            stamped.learnerKey,
+            stamped.kind,
+            stamped.status,
+            stamped.createdAt,
+            stamped.updatedAt,
+            encodeJson(stamped, `runtime session ${JSON.stringify(stamped.id)}`),
+          ],
+        );
+      } catch (error) {
+        if (isUniqueViolation(error)) {
+          throw new Error(
+            `@openmaic/storage: session ${JSON.stringify(stamped.id)} already exists`,
+            { cause: error },
+          );
+        }
+        throw error;
       }
-      throw error;
-    }
+    });
     return stamped;
   }
 
@@ -449,6 +494,145 @@ export class PgRuntimeStore implements RuntimeStore {
     await this.queryable.query('DELETE FROM runtime_sessions WHERE id = $1', [sessionId]);
   }
 
+  async setSessionStatusIfLatest(
+    sessionId: string,
+    status: RuntimeSessionStatus,
+    updatedAt: string,
+    options: RuntimeStatusIfLatestOptions = {},
+  ): Promise<boolean> {
+    const expectedLastSeq = options.expectedLastSeq;
+    const relevantSceneId = options.relevantSceneId;
+    if (
+      expectedLastSeq !== undefined &&
+      expectedLastSeq !== null &&
+      (!Number.isSafeInteger(expectedLastSeq) || expectedLastSeq < 0)
+    ) {
+      throw new Error('@openmaic/storage: expectedLastSeq must be null or a non-negative integer');
+    }
+    if (relevantSceneId !== undefined && typeof relevantSceneId !== 'string') {
+      throw new Error('@openmaic/storage: relevantSceneId must be a string when provided');
+    }
+    if (!isPgQueryableKey(sessionId)) {
+      throw new Error(`@openmaic/storage: no session ${JSON.stringify(sessionId)}`);
+    }
+    return await this.transaction(async (queryable) => {
+      // Row lock the target FIRST: its kind/partition drives the guard.
+      const row = await this.loadSession(queryable, sessionId, true);
+      if (!row) throw new Error(`@openmaic/storage: no session ${JSON.stringify(sessionId)}`);
+      if (isFutureRuntimeVersioned(row)) throw futureSessionError(sessionId, row);
+      // Partition advisory lock: a concurrent createSession / appendRecord /
+      // mergeLearner (which take the same xact-scoped lock) cannot commit a
+      // relevance change between this guard's check and its write under READ
+      // COMMITTED.
+      await acquirePartitionLock(queryable, row.stageId, row.learnerKey, row.kind);
+      // RELEVANCE + ORDER mirror the canonical quiz reader, not "any anchored
+      // record" and not SQL TEXT ordering. The runtime validator accepts
+      // zoned ISO timestamps (numeric offsets) and optional fractional
+      // seconds, and arbitrary string ids: the reader (and listSessions)
+      // orders by the createdAt INSTANT (`Date.parse`) with an `id.localeCompare`
+      // tie-break. SQL TEXT comparison of created_at/id DISAGREES with that
+      // order for valid stored values (e.g. root
+      // `2026-10-03T01:00:00+02:00` is OLDER than child
+      // `2026-10-03T00:00:00Z` by instant, yet sorts after it as TEXT;
+      // `...T00:00:00Z` vs `...T00:00:00.000Z` are equal instants that TEXT
+      // comparison never ties, and SQL collation is not localeCompare). The
+      // strictly-newer test therefore happens in JS on DECODED rows inside
+      // this transaction — stored timestamps/ids are never rewritten, and
+      // corrupt rows (unreadable createdAt) simply cannot establish
+      // newerness, matching the browser backend's raw-row behavior.
+      const targetInstant = Date.parse(row.createdAt);
+      const strictlyNewerByReaderOrder = (candidate: {
+        createdAt?: unknown;
+        id?: unknown;
+      }): boolean => {
+        if (typeof candidate.createdAt !== 'string' || typeof candidate.id !== 'string') {
+          return false; // unreadable raw facts never establish newerness
+        }
+        const candidateInstant = Date.parse(candidate.createdAt);
+        return (
+          candidateInstant > targetInstant ||
+          (candidateInstant === targetInstant && candidate.id.localeCompare(row.id) > 0)
+        );
+      };
+      // Every same-kind partition sibling comes back WITH the data of its
+      // LATEST record anchored to the repaired scene (max seq among
+      // scene-anchored rows — exactly the record `listRecords(sceneId)`
+      // returns last); adoption and newerness are then decided by the same
+      // JS checks the reader applies instead of a SQL approximation of them.
+      const params: unknown[] = [row.stageId, row.learnerKey, row.kind];
+      if (relevantSceneId !== undefined) params.push(relevantSceneId);
+      const candidates = await queryable.query<{
+        id: string;
+        session_data: unknown;
+        latest_record_data: unknown;
+      }>(
+        `SELECT s.id,
+                s.data AS session_data,
+                (SELECT r.data FROM runtime_records r
+                  WHERE r.session_id = s.id ${relevantSceneId === undefined ? '' : 'AND r.scene_id = $4'}
+                  ORDER BY r.seq DESC LIMIT 1) AS latest_record_data
+           FROM runtime_sessions s
+          WHERE s.stage_id = $1
+            AND learner_key = $2
+            AND s.kind = $3`,
+        params,
+      );
+      for (const sibling of candidates.rows) {
+        let decoded: unknown;
+        try {
+          decoded = decodeJson<unknown>(sibling.session_data);
+        } catch {
+          continue; // undecodable row: cannot establish newerness
+        }
+        if (!isPlainObject(decoded)) continue;
+        const rawCandidate = decoded as { createdAt?: unknown; id?: unknown };
+        // Strictly-newer FIRST, on the RAW decoded fields — the generic
+        // (unanchored) form stays conservative: ANY strictly-newer same-kind
+        // sibling blocks, envelope validity notwithstanding.
+        if (!strictlyNewerByReaderOrder(rawCandidate)) continue;
+        if (relevantSceneId === undefined) return false;
+        // Anchored form: envelope gate identical to listSessions — a corrupt
+        // sibling row is OMITTED by the canonical reader and never blocks.
+        try {
+          assertValid(
+            validateRuntimeSession(migrateSession(decoded as RuntimeSession)),
+            `stored runtime session ${JSON.stringify(sibling.id)}`,
+          );
+        } catch {
+          continue;
+        }
+        // ONLY the latest scene-anchored record's payload decides adoption:
+        // a malformed tail — even over a valid older draft — makes the
+        // reader SKIP this sibling, so it must not block here either.
+        const latestRaw = sibling.latest_record_data;
+        const latest =
+          latestRaw === null || latestRaw === undefined
+            ? undefined
+            : decodeJson<RuntimeRecord>(latestRaw);
+        if (latest !== undefined && isAdoptableQuizAttemptPayload(latest.payload)) {
+          return false; // the reader adopts this newer sibling: refuse
+        }
+      }
+      const updated: RuntimeSession = { ...migrateSession(row), status, updatedAt };
+      assertValid(validateRuntimeSession(updated), `runtime session ${JSON.stringify(sessionId)}`);
+      if (expectedLastSeq !== undefined) {
+        const last = await queryable.query<LastSeqRow>(
+          `SELECT COALESCE(MAX(seq), -1)::text AS last_seq
+             FROM runtime_records
+            WHERE session_id = $1`,
+          [sessionId],
+        );
+        const rawLastSeq = Number(last.rows[0]?.last_seq ?? -1);
+        const actualLastSeq = rawLastSeq < 0 ? null : rawLastSeq;
+        if (expectedLastSeq !== actualLastSeq) {
+          throw new RuntimeAppendConflictError(sessionId, expectedLastSeq, actualLastSeq);
+        }
+      }
+      await this.persistSession(queryable, updated);
+      return true;
+    });
+  }
+
   async appendRecord<TPayload extends RuntimePayload>(
     init: RuntimeRecordInit<TPayload>,
     options: RuntimeAppendOptions = {},
@@ -484,6 +668,15 @@ export class PgRuntimeStore implements RuntimeStore {
             throw new Error(`@openmaic/storage: no session ${JSON.stringify(init.sessionId)}`);
           }
           if (isFutureRuntimeVersioned(row)) throw futureSessionError(init.sessionId, row);
+
+          // Join the partition's shared serialization boundary BEFORE any
+          // relevance-visible change: a scene-anchored record appended to an
+          // already-created NEWER empty session flips the anchored guard's
+          // decision mid-flight otherwise (the guard's Tail-CAS locks only
+          // the OLD root — it cannot see this different session's insert).
+          // Same ordering as the guard: target row lock first, then the
+          // partition lock.
+          await acquirePartitionLock(queryable, row.stageId, row.learnerKey, row.kind);
 
           let session = row;
           if (needsRuntimeMigration(row)) {
@@ -600,13 +793,49 @@ export class PgRuntimeStore implements RuntimeStore {
     // contention/scalability surface, not a correctness issue; deployments that
     // need to cap the wait can mitigate it with PostgreSQL's lock_timeout.
     return this.transaction(async (queryable) => {
+      // Deterministic row-lock order first (id order), then the partition
+      // locks — the shared row→partition ordering. Rows only ever LEAVE the
+      // source partitions (relevance can only decrease there: safe), but they
+      // ARRIVE in the destination partitions, where their records can newly
+      // decide an anchored guard — so every DISTINCT destination partition is
+      // locked (sorted, so concurrent merges cannot deadlock) before any row
+      // is rewritten.
       const result = await queryable.query<StoredJsonRow>(
-        `SELECT data
+        `SELECT stage_id, kind, data
            FROM runtime_sessions
           WHERE learner_key = $1
+          ORDER BY id
           FOR UPDATE`,
         [fromLearnerKey],
       );
+      // Distinct destination partitions as TUPLES with an UNAMBIGUOUS
+      // identity: `kind` is an open string and ids may legitimately contain
+      // U+001F, so a separator-joined identity COLLIDES for distinct valid
+      // tuples — ((a, b\u001FquizAttempt) vs (a\u001Fb, quizAttempt)) — and
+      // would silently DROP a real destination partition, i.e. under-lock it.
+      // JSON array encoding is injective on string tuples; BOTH the dedupe
+      // and the deterministic ordering use it, so every actual destination
+      // partition is locked exactly once. (The full advisory LOCK KEY may
+      // still conservatively collide across partitions — that only
+      // over-serializes; the tuple enumeration must never drop a tuple.)
+      const partitionIdentity = (partition: { stageId: string; kind: string }): string =>
+        JSON.stringify([partition.stageId, partition.kind]);
+      const destinationPartitions: Array<{ stageId: string; kind: string }> = [];
+      const seenPartitions = new Set<string>();
+      for (const row of result.rows) {
+        const stageId = typeof row.stage_id === 'string' ? row.stage_id : null;
+        const kind = typeof row.kind === 'string' ? row.kind : null;
+        if (stageId === null || kind === null) continue;
+        const partition = { stageId, kind };
+        const identity = partitionIdentity(partition);
+        if (seenPartitions.has(identity)) continue;
+        seenPartitions.add(identity);
+        destinationPartitions.push(partition);
+      }
+      destinationPartitions.sort((a, b) => (partitionIdentity(a) < partitionIdentity(b) ? -1 : 1));
+      for (const partition of destinationPartitions) {
+        await acquirePartitionLock(queryable, partition.stageId, toLearnerKey, partition.kind);
+      }
       const updatedSessions = result.rows.map((row) => {
         const stored = decodeJson<RuntimeSession>(row.data);
         if (isFutureRuntimeVersioned(stored)) throw futureSessionError(stored.id, stored);

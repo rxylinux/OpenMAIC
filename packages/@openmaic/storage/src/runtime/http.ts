@@ -9,6 +9,7 @@ import type {
 import type {
   RuntimeAppendOptions,
   RuntimeSessionInit,
+  RuntimeStatusIfLatestOptions,
   RuntimeStore,
   RuntimeTailOptions,
 } from './types.js';
@@ -304,6 +305,39 @@ export class HttpRuntimeStore implements RuntimeStore {
     };
     assertJsonValue(body, `runtime session ${JSON.stringify(sessionId)} status update`);
     await this.request<void>('PATCH', `/runtime/sessions/${segment(sessionId)}/status`, body);
+  }
+
+  async setSessionStatusIfLatest(
+    sessionId: string,
+    status: RuntimeSessionStatus,
+    updatedAt: string,
+    options: RuntimeStatusIfLatestOptions = {},
+  ): Promise<boolean> {
+    const body = {
+      status,
+      updatedAt,
+      latestOnly: true,
+      ...(options.expectedLastSeq === undefined
+        ? {}
+        : { expectedLastSeq: options.expectedLastSeq }),
+      ...(options.relevantSceneId === undefined
+        ? {}
+        : { relevantSceneId: options.relevantSceneId }),
+    };
+    assertJsonValue(body, `runtime session ${JSON.stringify(sessionId)} guarded status update`);
+    try {
+      await this.request<void>('PATCH', `/runtime/sessions/${segment(sessionId)}/status`, body);
+      return true; // 204: the guarded write committed
+    } catch (error) {
+      if (
+        error instanceof HttpRuntimeStoreError &&
+        error.status === 409 &&
+        error.code === 'LINEAGE_ADVANCED'
+      ) {
+        return false; // the server refused: a relevant newer sibling exists
+      }
+      throw error;
+    }
   }
 
   async deleteSession(sessionId: string): Promise<void> {

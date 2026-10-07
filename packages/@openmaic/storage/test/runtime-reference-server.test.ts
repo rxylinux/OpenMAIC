@@ -8,6 +8,7 @@ import { BrowserRuntimeStore } from '../src/runtime/browser.js';
 import { HttpRuntimeStore } from '../src/runtime/http.js';
 import type { RuntimePayloadValidator, RuntimeStore } from '../src/runtime/types.js';
 import { createRuntimeHttpHandler } from '../src/server/index.js';
+import { RuntimeHttpError } from '../src/server/http-error.js';
 import {
   createReferenceRuntimeServer,
   type ConnectableQueryable,
@@ -261,6 +262,123 @@ describe('reference HTTP handler principal capabilities', () => {
       },
     );
     expect(oversized.status).toBe(413);
+  });
+
+  test('guarded status route: 204 when latest, 409 LINEAGE_ADVANCED when a relevant newer sibling exists, 501 when unsupported', async () => {
+    const store = new BrowserRuntimeStore({ indexedDB: new IDBFactory() });
+    const handler = createRuntimeHttpHandler(store, {
+      authenticate: async () => ({ learnerKey: 'learner-a' }),
+    });
+    const fetchAuth = handlerFetch(handler, async () => undefined);
+    const session = await store.createSession(
+      makeSession({ id: 'guarded-root', learnerKey: 'learner-a', kind: 'quizAttempt' }),
+    );
+    void session;
+    await store.appendRecord(
+      makeRecordInit('guarded-root', {
+        sceneId: 'scene-1',
+        payload: { payloadVersion: 1, phase: 'draft', answers: {} },
+      }),
+    );
+
+    // Uncontended guarded write commits (204) and the store row changed.
+    const ok = await fetchAuth(`${BASE_URL}/runtime/sessions/guarded-root/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        status: 'active',
+        updatedAt: '2026-10-03T00:00:00.000Z',
+        latestOnly: true,
+        relevantSceneId: 'scene-1',
+        expectedLastSeq: 0,
+      }),
+    });
+    expect(ok.status).toBe(204);
+    expect((await store.getSession('guarded-root'))?.status).toBe('active');
+    await store.setSessionStatus('guarded-root', 'completed', '2026-10-03T00:00:01.000Z', {
+      expectedLastSeq: 0,
+    });
+
+    // A genuinely newer RELEVANT sibling refuses the guarded write.
+    await store.createSession(
+      makeSession({
+        id: 'guarded-newer',
+        learnerKey: 'learner-a',
+        kind: 'quizAttempt',
+        createdAt: '2026-10-03T01:00:00.000Z',
+        updatedAt: '2026-10-03T01:00:00.000Z',
+      }),
+    );
+    await store.appendRecord(
+      makeRecordInit('guarded-newer', {
+        sceneId: 'scene-1',
+        payload: { payloadVersion: 1, phase: 'draft', answers: {} },
+      }),
+    );
+    const refused = await fetchAuth(`${BASE_URL}/runtime/sessions/guarded-root/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        status: 'active',
+        updatedAt: '2026-10-03T02:00:00.000Z',
+        latestOnly: true,
+        relevantSceneId: 'scene-1',
+      }),
+    });
+    expect(refused.status).toBe(409);
+    await expect(refused.json()).resolves.toMatchObject({
+      error: { code: 'LINEAGE_ADVANCED' },
+    });
+    expect((await store.getSession('guarded-root'))?.status).toBe('completed');
+
+    // An UNANCHORED (generic) request is also refused by the newer sibling…
+    const refusedGeneric = await fetchAuth(`${BASE_URL}/runtime/sessions/guarded-root/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        status: 'active',
+        updatedAt: '2026-10-03T02:00:01.000Z',
+        latestOnly: true,
+      }),
+    });
+    expect(refusedGeneric.status).toBe(409);
+    // …but the same newer sibling does NOT block a guard anchored to a
+    // scene it has no records for (relevance mirrors the canonical reader).
+    const otherScene = await fetchAuth(`${BASE_URL}/runtime/sessions/guarded-root/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        status: 'active',
+        updatedAt: '2026-10-03T02:00:02.000Z',
+        latestOnly: true,
+        relevantSceneId: 'scene-OTHER',
+      }),
+    });
+    expect(otherScene.status).toBe(204);
+
+    // A store WITHOUT the atomic capability honestly refuses (501) instead
+    // of silently downgrading to an unguarded write.
+    const stubStore = new Proxy(store, {
+      get(target, prop) {
+        if (prop === 'setSessionStatusIfLatest') return undefined; // unsupported
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as RuntimeStore;
+    const stubHandler = createRuntimeHttpHandler(stubStore, {
+      authenticate: async () => ({ learnerKey: 'learner-a' }),
+    });
+    const stubResponse = await handlerFetch(stubHandler, async () => undefined)(
+      `${BASE_URL}/runtime/sessions/guarded-root/status`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({
+          status: 'completed',
+          updatedAt: '2026-10-03T03:00:00.000Z',
+          latestOnly: true,
+        }),
+      },
+    );
+    expect(stubResponse.status).toBe(501);
+    await expect(stubResponse.json()).resolves.toMatchObject({
+      error: { code: 'LINEAGE_GUARD_UNSUPPORTED' },
+    });
   });
 
   test('returns 403 FORBIDDEN_LEARNER on learner routes without learnerKey', async () => {
@@ -906,5 +1024,190 @@ describe('reference HTTP handler ownership ordering', () => {
     expect(response.status).toBe(404);
     expect(reads).toBe(2);
     expect(deleted).toBe(false);
+  });
+});
+
+// --- final review: ≥500 redaction is preserved; only the deliberate
+// unsupported-guard sentinel keeps its fixed public fields at ≥500 ----------
+
+describe('reference HTTP handler internal-error redaction boundary', () => {
+  test('a sensitive ≥500 RuntimeHttpError from a STORE callback is redacted to generic INTERNAL_ERROR', async () => {
+    const secret = 'postgres password=do-not-reflect';
+    const dsn = 'postgres://user:supersecret@db.internal:5432/prod';
+    const underlying = new RuntimeHttpError(500, 'DB_INTERNAL', secret, { dsn });
+    const store = {
+      getSession: async () => {
+        throw underlying;
+      },
+    } as unknown as RuntimeStore;
+    const handler = createRuntimeHttpHandler(store, {
+      authenticate: async () => ({ learnerKey: 'learner-a' }),
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const response = await handlerFetch(
+        handler,
+        async () => 'Bearer learner-a',
+      )(`${BASE_URL}/runtime/sessions/session-a`);
+      const text = await response.text();
+
+      expect(response.status).toBe(500);
+      expect(text).not.toContain(secret);
+      expect(text).not.toContain(dsn);
+      expect(text).not.toContain('DB_INTERNAL');
+      expect(JSON.parse(text)).toEqual({
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: '@openmaic/storage: internal server error',
+        },
+      });
+      // The server-side operator log keeps the underlying failure.
+      expect(consoleError).toHaveBeenCalledWith(
+        '@openmaic/storage: Runtime HTTP handler internal error',
+        underlying,
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  test('a sensitive ≥500 RuntimeHttpError from the AUTH callback is redacted too', async () => {
+    const secret = 'oidc client secret=do-not-reflect';
+    const store = new BrowserRuntimeStore({ indexedDB: new IDBFactory() });
+    const handler = createRuntimeHttpHandler(store, {
+      authenticate: async () => {
+        throw new RuntimeHttpError(500, 'AUTH_INTERNAL', secret, { audience: 'do-not-reflect' });
+      },
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const response = await handlerFetch(
+        handler,
+        async () => 'Bearer learner-a',
+      )(`${BASE_URL}/runtime/sessions/session-a`);
+      const text = await response.text();
+
+      expect(response.status).toBe(500);
+      expect(text).not.toContain(secret);
+      expect(text).not.toContain('do-not-reflect');
+      expect(JSON.parse(text)).toEqual({
+        error: { code: 'INTERNAL_ERROR', message: '@openmaic/storage: internal server error' },
+      });
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  test('the deliberate unsupported-guard 501 still reaches the client with its FIXED fields', async () => {
+    const store = new BrowserRuntimeStore({ indexedDB: new IDBFactory() });
+    await store.createSession(makeSession({ id: 'guarded-501', learnerKey: 'learner-a' }));
+    const stubStore = new Proxy(store, {
+      get(target, prop) {
+        if (prop === 'setSessionStatusIfLatest') return undefined;
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as RuntimeStore;
+    const handler = createRuntimeHttpHandler(stubStore, {
+      authenticate: async () => ({ learnerKey: 'learner-a' }),
+    });
+    const response = await handlerFetch(handler, async () => undefined)(
+      `${BASE_URL}/runtime/sessions/guarded-501/status`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({
+          status: 'active',
+          updatedAt: '2026-10-03T00:00:00.000Z',
+          latestOnly: true,
+          relevantSceneId: 'scene-1',
+        }),
+      },
+    );
+
+    expect(response.status).toBe(501);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: 'LINEAGE_GUARD_UNSUPPORTED',
+        message: '@openmaic/storage: this runtime store does not support the atomic lineage guard',
+      },
+    });
+  });
+});
+
+// --- final review: anchored relevance through the route mirrors the reader --
+
+describe('reference HTTP handler guarded-status anchored reader-equivalence', () => {
+  test('a malformed latest tail does not block (204); a valid latest record does (409)', async () => {
+    const store = new BrowserRuntimeStore({ indexedDB: new IDBFactory() });
+    const handler = createRuntimeHttpHandler(store, {
+      authenticate: async () => ({ learnerKey: 'learner-a' }),
+    });
+    const fetchAuth = handlerFetch(handler, async () => undefined);
+    const quizSession = (id: string, createdAt: string) =>
+      makeSession({
+        id,
+        learnerKey: 'learner-a',
+        kind: 'quizAttempt',
+        createdAt,
+        updatedAt: createdAt,
+      });
+    await store.createSession(quizSession('anchored-root', '2026-10-03T00:00:00.000Z'));
+    await store.appendRecord(
+      makeRecordInit('anchored-root', {
+        sceneId: 'scene-1',
+        payload: { payloadVersion: 1, phase: 'draft', answers: {} },
+      }),
+    );
+    await store.createSession(quizSession('anchored-newer', '2026-10-03T01:00:00.000Z'));
+    // seq 0: a valid scene-1 draft; seq 1: a malformed scene-1 TAIL (no
+    // payloadVersion — stored by the skeleton gate, never reader-adopted).
+    await store.appendRecord(
+      makeRecordInit('anchored-newer', {
+        sceneId: 'scene-1',
+        payload: { payloadVersion: 1, phase: 'draft', answers: { q1: 'A' } },
+      }),
+    );
+    await store.appendRecord(
+      makeRecordInit('anchored-newer', {
+        sceneId: 'scene-1',
+        payload: { phase: 'draft', answers: { q1: 'A' } },
+      }),
+    );
+
+    const patch = (body: unknown) =>
+      fetchAuth(`${BASE_URL}/runtime/sessions/anchored-root/status`, {
+        method: 'PATCH',
+        body: JSON.stringify(body),
+      });
+
+    // The reader skips the malformed-tail sibling: the guarded write commits.
+    const tailMalformed = await patch({
+      status: 'active',
+      updatedAt: '2026-10-03T02:00:00.000Z',
+      latestOnly: true,
+      relevantSceneId: 'scene-1',
+    });
+    expect(tailMalformed.status).toBe(204);
+
+    // A VALID latest scene record now exists: the same write is refused with
+    // 409 LINEAGE_ADVANCED and nothing is written.
+    await store.appendRecord(
+      makeRecordInit('anchored-newer', {
+        sceneId: 'scene-1',
+        payload: { payloadVersion: 1, phase: 'submitted', answers: { q1: 'A' } },
+      }),
+    );
+    await store.setSessionStatus('anchored-root', 'completed', '2026-10-03T02:00:01.000Z');
+    const refused = await patch({
+      status: 'active',
+      updatedAt: '2026-10-03T03:00:00.000Z',
+      latestOnly: true,
+      relevantSceneId: 'scene-1',
+    });
+    expect(refused.status).toBe(409);
+    await expect(refused.json()).resolves.toMatchObject({
+      error: { code: 'LINEAGE_ADVANCED' },
+    });
+    expect((await store.getSession('anchored-root'))?.status).toBe('completed');
   });
 });

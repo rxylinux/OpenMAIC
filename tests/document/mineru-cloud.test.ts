@@ -1,6 +1,24 @@
 import JSZip from 'jszip';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { parseWithMinerUCloud } from '@/lib/pdf/mineru-cloud';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  providerFetch: vi.fn(),
+  promisesLookup: vi.fn(),
+}));
+
+vi.mock('@/lib/server/provider-fetch', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/server/provider-fetch')>();
+  return { ...actual, providerFetch: mocks.providerFetch };
+});
+
+vi.mock('node:dns', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:dns')>();
+  return {
+    ...actual,
+    lookup: vi.fn(),
+    promises: { ...actual.promises, lookup: mocks.promisesLookup },
+  };
+});
 
 vi.mock('@/lib/logger', () => ({
   createLogger: () => ({
@@ -10,6 +28,14 @@ vi.mock('@/lib/logger', () => ({
     debug: vi.fn(),
   }),
 }));
+
+import { parseWithMinerUCloud } from '@/lib/pdf/mineru-cloud';
+
+beforeEach(() => {
+  mocks.providerFetch.mockReset();
+  mocks.promisesLookup.mockReset();
+  mocks.promisesLookup.mockResolvedValue([{ address: '93.184.216.34', family: 4 }]);
+});
 
 describe('MinerU Cloud document upload', () => {
   afterEach(() => {
@@ -21,7 +47,7 @@ describe('MinerU Cloud document upload', () => {
     zip.file('full.md', '# Parsed lesson');
     const zipBuffer = await zip.generateAsync({ type: 'nodebuffer' });
     const batchBodies: unknown[] = [];
-    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith('/file-urls/batch')) {
         batchBodies.push(JSON.parse(String(init?.body)));
@@ -67,7 +93,7 @@ describe('MinerU Cloud document upload', () => {
       }
       throw new Error(`Unexpected fetch: ${url}`);
     });
-    vi.stubGlobal('fetch', fetchMock);
+    mocks.providerFetch.mockImplementation(fetchMock as never);
 
     const result = await parseWithMinerUCloud(
       {
@@ -93,7 +119,7 @@ describe('MinerU Cloud document upload', () => {
     zip.file('full.md', '# Parsed legacy lesson');
     const zipBuffer = await zip.generateAsync({ type: 'nodebuffer' });
     const batchBodies: unknown[] = [];
-    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith('/file-urls/batch')) {
         batchBodies.push(JSON.parse(String(init?.body)));
@@ -139,7 +165,7 @@ describe('MinerU Cloud document upload', () => {
       }
       throw new Error(`Unexpected fetch: ${url}`);
     });
-    vi.stubGlobal('fetch', fetchMock);
+    mocks.providerFetch.mockImplementation(fetchMock as never);
 
     const result = await parseWithMinerUCloud(
       {

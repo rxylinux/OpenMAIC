@@ -146,6 +146,8 @@ import { createLogger } from '@/lib/logger';
 import { extractMinerUResult } from './mineru-parser';
 import { parseWithMinerUCloud } from './mineru-cloud';
 import { parseWithAliDocMindClient } from './alidocmind-client';
+import { providerFetch, type ProviderFetchPolicy } from '@/lib/server/provider-fetch';
+import { safeErrorCode } from '@/lib/utils/safe-error-code';
 import { preparePdfImage } from '@/lib/document/extractors/images';
 
 const log = createLogger('PDFProviders');
@@ -184,11 +186,46 @@ export function describeSelfHostedMinerUError(status: number, rawBody: string): 
     );
   }
 
-  // Unknown failure — keep the raw detail but bound its length so the UI stays
-  // readable rather than showing an entire JSON blob or traceback.
-  const detail = rawBody.trim().slice(0, 300);
-  return `MinerU API error (${status})${detail ? `: ${detail}` : ''}`;
+  // Unknown failure: report the status only. The body is logged by the caller
+  // and never echoed, so the parse route cannot relay a target's content.
+  return `MinerU API error (${status})`;
 }
+
+// Self-hosted MinerU policy follows endpoint provenance: a server-managed
+// endpoint is operator configuration and may reach a local network without the
+// opt-in; an explicit request-supplied base URL is arbitrary caller input and
+// runs under the strict public policy (the operator's ALLOW_LOCAL_NETWORKS
+// opt-in is not inherited by it); a config-default endpoint keeps the operator
+// policy. Either way the strict transport pins the connect address to the
+// vetted DNS answers and refuses a 3xx instead of following it.
+const SELF_HOSTED_MINERU_POLICY: ProviderFetchPolicy = {
+  allowLocalNetworks: undefined,
+  rejectRedirects: true,
+};
+const MANAGED_SELF_HOSTED_MINERU_POLICY: ProviderFetchPolicy = {
+  allowLocalNetworks: true,
+  rejectRedirects: true,
+};
+const CALLER_SELF_HOSTED_MINERU_POLICY: ProviderFetchPolicy = {
+  allowLocalNetworks: false,
+  rejectRedirects: true,
+};
+
+function selfHostedMineruPolicy(config: PDFParserConfig): ProviderFetchPolicy {
+  if (config.managed) return MANAGED_SELF_HOSTED_MINERU_POLICY;
+  // An unmanaged provider with an explicit base URL is caller-supplied by
+  // default: server-internal callers resolve server config only and mark
+  // themselves managed, so this default cannot mislabel operator endpoints.
+  const callerSupplied =
+    config.callerSuppliedBaseUrl ?? (Boolean(config.baseUrl) && !config.managed);
+  if (callerSupplied) return CALLER_SELF_HOSTED_MINERU_POLICY;
+  return SELF_HOSTED_MINERU_POLICY;
+}
+
+const SELF_HOSTED_MINERU_CONNECTION_FAILED =
+  'Cannot connect to the self-hosted MinerU server, please check the Base URL';
+const SELF_HOSTED_MINERU_INVALID_RESPONSE =
+  'The self-hosted MinerU server returned an invalid response';
 
 /**
  * Parse PDF using specified provider
@@ -392,22 +429,19 @@ const ALIDOCMIND_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const ALIDOCMIND_IMAGE_CONCURRENCY = 6;
 
 /**
- * AliDocMind returns image URLs on Aliyun OSS. Restrict fetches to OSS hosts so
- * a compromised/custom endpoint can't turn image extraction into an SSRF vector
- * pointing at internal hosts. Matches `*.oss-*.aliyuncs.com` (and the
- * doc-mind-video bucket host family).
- */
-/**
  * AliDocMind returns image URLs on Aliyun OSS. Restrict fetches to Aliyun OSS
- * hosts so a compromised/custom endpoint can't turn image extraction into an
- * SSRF vector pointing at internal hosts. Only `*.aliyuncs.com` over http/https
- * is allowed (OSS signed URLs are sometimes served over http; the fetch upgrades
- * them to https).
+ * hosts over HTTPS so a compromised/custom endpoint can't turn image extraction
+ * into an SSRF vector pointing at internal hosts. Matches `*.oss-*.aliyuncs.com`
+ * (and the doc-mind-video bucket host family); the signed query stays out of
+ * every log line.
  */
 function isTrustedAliyunOssUrl(url: string): boolean {
   try {
     const u = new URL(url);
-    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    // Provider-returned image URLs are held to public HTTPS: the allowlist
+    // below plus the strict transport's address policy (metadata and reserved
+    // ranges refused regardless of the operator opt-in).
+    if (u.protocol !== 'https:') return false;
     const host = u.hostname.toLowerCase();
     // Must be an oss-*.aliyuncs.com host (rules out arbitrary *.aliyuncs.com
     // subdomains that aren't object storage).
@@ -419,24 +453,34 @@ function isTrustedAliyunOssUrl(url: string): boolean {
 
 /**
  * Download an AliDocMind image URL and return a PNG base64 data URL.
- * Only trusted Aliyun OSS hosts are fetched; downloads are size-capped and
- * redirects are disallowed (an OSS signed URL never needs one). Returns null on
- * any failure so one bad image never fails the whole parse.
+ * Only trusted Aliyun OSS hosts over public HTTPS are fetched; the request runs
+ * through the strict provider transport (connect-time DNS pinning, redirects
+ * refused) and downloads are size-capped while streaming. Returns null on any
+ * failure so one bad image never fails the whole parse.
+ *
+ * The URL is provider-returned (not configuration), so it is held to the strict
+ * public policy regardless of the endpoint policy the DocMind SDK connection
+ * itself uses. Logs never include the signed query string.
  */
 export async function fetchAliDocMindImageAsBase64(url: string): Promise<string | null> {
   if (!isTrustedAliyunOssUrl(url)) {
-    log.warn(`[AliDocMind] refusing non-OSS image URL: ${url.slice(0, 80)}`);
+    log.warn(`[AliDocMind] refusing non-OSS image URL: ${describeUrlWithoutQuery(url)}`);
     return null;
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      redirect: 'error', // signed OSS URLs are direct; a redirect is suspicious
-    });
+    const res = await providerFetch(
+      url,
+      {
+        signal: controller.signal,
+        // signed OSS URLs are direct; a redirect is suspicious
+        redirect: 'error',
+      },
+      { allowLocalNetworks: false, requireHttps: true, rejectRedirects: true },
+    );
     if (!res.ok) {
-      log.warn(`[AliDocMind] image fetch ${res.status} for ${url.slice(0, 80)}`);
+      log.warn(`[AliDocMind] image fetch ${res.status} for ${describeUrlWithoutQuery(url)}`);
       return null;
     }
     // Reject early on a declared oversized length…
@@ -474,12 +518,25 @@ export async function fetchAliDocMindImageAsBase64(url: string): Promise<string 
     const png = await sharp(buf).png().toBuffer();
     return `data:image/png;base64,${png.toString('base64')}`;
   } catch (err) {
+    // A transport error's message can embed the full signed URL; the sanitized
+    // origin/path is already in the prefix and only the error's code/class
+    // follows it.
     log.warn(
-      `[AliDocMind] image fetch/convert failed: ${err instanceof Error ? err.message : err}`,
+      `[AliDocMind] image fetch/convert failed for ${describeUrlWithoutQuery(url)}: ${safeErrorCode(err)}`,
     );
     return null;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+/** Origin + path only: the signed query of an OSS URL never enters the log. */
+function describeUrlWithoutQuery(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`.slice(0, 120);
+  } catch {
+    return '<invalid url>';
   }
 }
 
@@ -667,27 +724,44 @@ export async function parseWithMinerUDocument(
   }
 
   // POST /file_parse
-  const response = await fetch(`${config.baseUrl}/file_parse`, {
-    method: 'POST',
-    headers,
-    body: formData,
-  });
+  let response: Response;
+  try {
+    response = await providerFetch(
+      `${config.baseUrl}/file_parse`,
+      { method: 'POST', headers, body: formData },
+      selfHostedMineruPolicy(config),
+    );
+  } catch (error) {
+    // Refused, unresolvable, policy-blocked and redirecting targets all get
+    // the same message; the transport detail stays in the server log.
+    log.error('[MinerU] Request to the self-hosted server failed:', error);
+    throw new Error(SELF_HOSTED_MINERU_CONNECTION_FAILED, { cause: error });
+  }
 
   if (!response.ok) {
-    const errorText = await response.text().catch(() => response.statusText);
+    const errorText = await response.text().catch(() => '');
+    log.error(`[MinerU] file_parse failed [status=${response.status}]: ${errorText.slice(0, 500)}`);
     throw new Error(describeSelfHostedMinerUError(response.status, errorText));
   }
 
-  const json = await response.json();
+  // A body that is not JSON must not surface the parser's message: Node's
+  // SyntaxError quotes a snippet of the input.
+  let json: { results?: Record<string, Record<string, unknown>> };
+  try {
+    json = await response.json();
+  } catch (error) {
+    log.error('[MinerU] file_parse returned a non-JSON body:', error);
+    throw new Error(SELF_HOSTED_MINERU_INVALID_RESPONSE, { cause: error });
+  }
 
   // Response: { results: { "<fileName>": { md_content, images, content_list, ... } } }
   const fileResult = json.results?.[options.fileName];
   if (!fileResult) {
     const keys = json.results ? Object.keys(json.results) : [];
     // Try first available key in case filename doesn't match exactly
-    const fallback = keys.length > 0 ? json.results[keys[0]] : null;
+    const fallback = keys.length > 0 ? (json.results?.[keys[0]] ?? null) : null;
     if (!fallback) {
-      throw new Error(`MinerU returned no results. Response keys: ${JSON.stringify(keys)}`);
+      throw new Error('MinerU returned no results');
     }
     log.warn(`[MinerU] Filename mismatch, using key "${keys[0]}" instead of "${options.fileName}"`);
     return extractMinerUResult(fallback);

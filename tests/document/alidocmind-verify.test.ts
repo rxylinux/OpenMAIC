@@ -53,7 +53,10 @@ describe('verifyAliDocMindCredentials', () => {
     });
     const result = await verifyAliDocMindCredentials(CREDS);
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toMatch(/NoPermission/);
+    if (!result.ok)
+      expect(result.error).toBe(
+        'AliDocMind rejected the request, please check that the AccessKey has DocMind permission',
+      );
   });
 
   it('accepts a success body (code 200)', async () => {
@@ -81,7 +84,10 @@ describe('verifyAliDocMindCredentials', () => {
     );
     const result = await verifyAliDocMindCredentials(CREDS);
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toMatch(/InvalidAccessKeyId/);
+    if (!result.ok)
+      expect(result.error).toBe(
+        'Could not verify with AliDocMind, please check the AccessKey ID/Secret and endpoint',
+      );
   });
 
   it('accepts a thrown job-not-found business error', async () => {

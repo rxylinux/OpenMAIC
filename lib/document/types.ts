@@ -22,6 +22,18 @@ export interface DocumentExtractorConfig {
   allowEnvFallback?: boolean;
   /** Skip image extraction when the caller needs text only. */
   textOnly?: boolean;
+  /**
+   * Whether the provider is server-managed (operator configuration). Server
+   * callers set it; a managed base URL may reach a local network without the
+   * ALLOW_LOCAL_NETWORKS opt-in under the strict parser transports.
+   */
+  managed?: boolean;
+  /**
+   * Whether the base URL was supplied by the request (unmanaged BYOK): such a
+   * URL runs under the strict public policy. Server callers set it; never
+   * request input.
+   */
+  callerSuppliedBaseUrl?: boolean;
 }
 
 export interface DocumentExtractorInput {

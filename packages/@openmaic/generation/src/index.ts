@@ -19,10 +19,12 @@ export {
   extractWidgetConfig,
   generateSceneActions,
   generateSceneContent,
+  generateSimilarQuestion,
   generateWidgetContent,
   PBLGenerationError,
   resolveImageIds,
 } from './scene-generator.js';
+export type { SimilarQuestionInput } from './scene-generator.js';
 export type {
   SceneActionsOptions,
   SceneContentFailure,

@@ -227,7 +227,7 @@ describe('PgRuntimeStore Postgres behavior', () => {
     await expect(rejection).rejects.not.toMatchObject({ code: '22P05' });
   });
 
-  test('single-statement deletes do not invoke the transaction hook', async () => {
+  test('creation serializes through the transaction hook; single-statement deletes never invoke it', async () => {
     let transactionCalls = 0;
     const directDeleteStore = new PgRuntimeStore(db, {
       withTransaction: (body) => {
@@ -235,15 +235,19 @@ describe('PgRuntimeStore Postgres behavior', () => {
         return db.transaction((tx: Queryable) => body(tx));
       },
     });
+    // Creation now runs inside the partition advisory-lock transaction (the
+    // atomic lineage-guard serialization with setSessionStatusIfLatest) —
+    // exactly one transaction hook call per creation.
     await directDeleteStore.createSession(makeSession({ id: 'by-id' }));
     await directDeleteStore.createSession(makeSession({ id: 'by-learner' }));
     await directDeleteStore.createSession(makeSession({ id: 'by-stage', learnerKey: 'user:42' }));
+    expect(transactionCalls).toBe(3);
 
     await directDeleteStore.deleteSession('by-id');
     await directDeleteStore.deleteLearnerRuntime('stage-1', 'anon:device-1');
     await directDeleteStore.deleteStageRuntime('stage-1');
 
-    expect(transactionCalls).toBe(0);
+    expect(transactionCalls).toBe(3); // deletes remain single-statement
   });
 
   test('deterministically retries two appends interleaved between MAX(seq) and INSERT', async () => {

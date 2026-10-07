@@ -9,6 +9,8 @@ import type {
   ImageGenerationOptions,
   ImageGenerationResult,
 } from '../types';
+import { mediaFetchFor } from '../media-fetch';
+import { isRejectedRedirectError } from '@/lib/utils/rejected-redirect';
 import { requireModel } from '../require-model';
 
 const BASE_URL = 'https://api.minimaxi.com';
@@ -18,12 +20,13 @@ export async function generateWithMiniMaxImage(
   options: ImageGenerationOptions,
 ): Promise<ImageGenerationResult> {
   const baseUrl = (config.baseUrl || BASE_URL).replace(/\/$/, '');
+  const fetchImpl = mediaFetchFor(config);
 
   const model = requireModel(config.model, 'MiniMax Image');
 
   const aspectRatio = options.aspectRatio || '1:1';
 
-  const response = await fetch(`${baseUrl}/v1/image_generation`, {
+  const response = await fetchImpl(`${baseUrl}/v1/image_generation`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${config.apiKey}`,
@@ -89,7 +92,8 @@ export async function testMiniMaxImageConnectivity(
 ): Promise<{ success: boolean; message: string }> {
   try {
     const baseUrl = (config.baseUrl || BASE_URL).replace(/\/$/, '');
-    const response = await fetch(`${baseUrl}/v1/image_generation`, {
+    const fetchImpl = mediaFetchFor(config);
+    const response = await fetchImpl(`${baseUrl}/v1/image_generation`, {
       method: 'POST',
       redirect: 'manual',
       headers: {
@@ -108,10 +112,19 @@ export async function testMiniMaxImageConnectivity(
       return { success: true, message: 'MiniMax Image API connected' };
     }
 
-    const errData = await response.json().catch(() => ({}));
-    const msg = errData?.base_resp?.status_msg || response.statusText;
-    return { success: false, message: `API error: ${msg}` };
+    // Fixed text only: the provider's body never reaches the caller.
+    await response.body?.cancel().catch(() => undefined);
+    if (response.status === 401 || response.status === 403) {
+      return { success: false, message: `MiniMax Image auth failed (${response.status})` };
+    }
+    return { success: false, message: `MiniMax Image API error (HTTP ${response.status})` };
   } catch (err) {
-    return { success: false, message: `Connection failed: ${(err as Error).message}` };
+    if (isRejectedRedirectError(err)) {
+      return {
+        success: false,
+        message: 'MiniMax Image connectivity error: Redirects are not allowed',
+      };
+    }
+    return { success: false, message: 'MiniMax Image connectivity error: request failed' };
   }
 }

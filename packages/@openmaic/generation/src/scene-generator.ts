@@ -895,6 +895,10 @@ async function generateQuizContent(
   const questions: QuizQuestion[] = generatedQuestions.map((q) => {
     const isText = q.type === 'short_answer';
     const options = isText ? undefined : normalizeQuizOptions(q.options);
+    const knowledgePoint =
+      typeof q.knowledgePoint === 'string' && q.knowledgePoint.trim()
+        ? q.knowledgePoint.trim()
+        : undefined;
     return {
       ...q,
       id: q.id || `q_${nanoid(8)}`,
@@ -903,6 +907,7 @@ async function generateQuizContent(
         ? undefined
         : normalizeQuizAnswer(q as unknown as Record<string, unknown>, options),
       hasAnswer: isText ? false : true,
+      ...(knowledgePoint ? { knowledgePoint } : { knowledgePoint: undefined }),
     };
   });
 
@@ -952,6 +957,7 @@ function normalizeQuizOptions(
  * the grading-side resolver, which must not accept a variant a stored key
  * would never resolve to.
  */
+
 export function normalizeQuizAnswer(
   question: Record<string, unknown>,
   options?: { value: string; label: string }[],
@@ -982,6 +988,99 @@ export function normalizeQuizAnswer(
     if (candidates.size === 1) return [...candidates][0];
     return a;
   });
+}
+
+/** One stored question, as the mistake-book practice flow hands it over. */
+export interface SimilarQuestionInput {
+  questionType: 'single' | 'multiple' | 'short_answer';
+  question: string;
+  /** QuizOption[] snapshot from the stored record. */
+  options?: unknown;
+  correctAnswer?: unknown;
+  analysis?: string;
+  /** Grading rubric for short answers. */
+  commentPrompt?: string;
+  /** Absent on legacy captures — the prompt then infers the point. */
+  knowledgePoint?: string;
+  difficulty?: 'easy' | 'medium' | 'hard';
+  languageDirective?: string;
+}
+
+/**
+ * Generate ONE fresh question for the same knowledge point as a stored
+ * mistake record — same question type, new stem/scenario/options. Used by
+ * the mistake book's same-point practice; fail-closed (null) on any parse or
+ * shape problem so the caller can fall back to redoing the original.
+ */
+export async function generateSimilarQuestion(
+  input: SimilarQuestionInput,
+  aiCall: AICallFn,
+): Promise<QuizQuestion | null> {
+  const difficulty = input.difficulty ?? 'medium';
+  const optionsBlock =
+    input.options && Array.isArray(input.options)
+      ? `Options:\n${input.options
+          .map((opt) => {
+            if (typeof opt === 'string') return `- ${opt}`;
+            const record = opt as { label?: unknown; value?: unknown };
+            const label =
+              typeof record.label === 'string' ? record.label : String(record.value ?? '');
+            const value = typeof record.value === 'string' ? record.value : '';
+            return value ? `- (${value}) ${label}` : `- ${label}`;
+          })
+          .join('\n')}`
+      : '';
+  const correctAnswerText = Array.isArray(input.correctAnswer)
+    ? input.correctAnswer.map(String).join(', ')
+    : input.correctAnswer != null
+      ? String(input.correctAnswer)
+      : 'N/A';
+
+  const prompts = buildPrompt(PROMPT_IDS.SIMILAR_QUESTION, {
+    questionType: input.questionType,
+    question: input.question,
+    optionsBlock,
+    correctAnswer: correctAnswerText,
+    analysis: input.analysis ?? 'N/A',
+    knowledgePoint: input.knowledgePoint ?? '(infer it from the original question and analysis)',
+    difficulty,
+    languageDirective: input.languageDirective || DEFAULT_LANGUAGE_DIRECTIVE,
+  });
+  if (!prompts) return null;
+
+  const response = await aiCall(prompts.system, prompts.user);
+  const generated = parseJsonResponse<QuizQuestion>(response);
+  if (!generated || typeof generated !== 'object' || typeof generated.question !== 'string') {
+    return null;
+  }
+
+  const isText = input.questionType === 'short_answer';
+  // The generated type must honor the ORIGINAL's type: a model drifting to
+  // another type would break the practice contract ("same type, same point").
+  if (generated.type !== input.questionType) return null;
+
+  const options = isText ? undefined : normalizeQuizOptions(generated.options);
+  if (!isText && (!options || options.length < 2)) return null;
+  const knowledgePoint =
+    typeof generated.knowledgePoint === 'string' && generated.knowledgePoint.trim()
+      ? generated.knowledgePoint.trim()
+      : input.knowledgePoint;
+
+  return {
+    id: `q_similar_${nanoid(8)}`,
+    type: input.questionType,
+    question: generated.question,
+    options,
+    answer: isText
+      ? undefined
+      : normalizeQuizAnswer(generated as unknown as Record<string, unknown>, options),
+    hasAnswer: isText ? false : true,
+    points: typeof generated.points === 'number' && generated.points > 0 ? generated.points : 1,
+    ...(generated.analysis ? { analysis: generated.analysis } : {}),
+    ...(input.commentPrompt ? { commentPrompt: input.commentPrompt } : {}),
+    ...(generated.commentPrompt && isText ? { commentPrompt: generated.commentPrompt } : {}),
+    ...(knowledgePoint ? { knowledgePoint } : {}),
+  };
 }
 
 /**

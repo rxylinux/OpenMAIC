@@ -7,6 +7,22 @@
  * suffix-strip fallback) and try each until one returns a model list.
  */
 
+import { createProviderFetch, isRejectedRedirectError } from '@/lib/server/provider-fetch';
+
+/** The `fetch`-shaped transport one candidate request is issued with. */
+export type ModelFetchTransport = (url: string, init: RequestInit) => Promise<Response>;
+
+/**
+ * Default transport: the strict provider fetch under the strict public policy —
+ * model discovery URLs are caller input, so private/loopback/CGNAT targets are
+ * refused even when the operator opted into ALLOW_LOCAL_NETWORKS, the connect
+ * address is pinned to the vetted DNS answers, and a 3xx is refused.
+ */
+const pinnedModelsFetch: ModelFetchTransport = createProviderFetch({
+  allowLocalNetworks: false,
+  rejectRedirects: true,
+});
+
 /** A model id discovered from a provider's /models endpoint. */
 export interface FetchedModel {
   id: string;
@@ -110,8 +126,9 @@ interface ModelsApiResponse {
 
 /**
  * Fetches the model list by trying each candidate URL in order. A 404/405 means
- * "wrong path" and moves on to the next candidate; any other non-2xx is returned
- * as an error immediately (e.g. 401 = bad key, surfaced to the caller verbatim).
+ * "wrong path" and moves on to the next candidate; any other non-2xx is thrown
+ * as a {@link ModelFetchError} immediately (e.g. 401 = bad key), carrying the
+ * status but never the provider's body.
  *
  * Throws on network failure or when all candidates 404. The caller (probe route)
  * is responsible for SSRF validation of `baseUrl` before calling this.
@@ -119,8 +136,9 @@ interface ModelsApiResponse {
 export async function fetchModels(
   baseUrl: string,
   apiKey: string,
-  opts: { modelsUrlOverride?: string } = {},
+  opts: { modelsUrlOverride?: string; fetchImpl?: ModelFetchTransport } = {},
 ): Promise<FetchedModel[]> {
+  const transport = opts.fetchImpl ?? pinnedModelsFetch;
   const candidates = buildModelsUrlCandidates(baseUrl, opts);
 
   const deadline = Date.now() + DISCOVERY_TIMEOUT_MS;
@@ -132,7 +150,12 @@ export async function fetchModels(
       const remaining = deadline - Date.now();
       if (remaining <= 0) throw discoveryTimeout();
       try {
-        body = await fetchModelsCandidate(url, apiKey, Math.min(FETCH_TIMEOUT_MS, remaining));
+        body = await fetchModelsCandidate(
+          url,
+          apiKey,
+          Math.min(FETCH_TIMEOUT_MS, remaining),
+          transport,
+        );
         break;
       } catch (error) {
         // HTTP errors and malformed JSON are terminal. Only a transport failure
@@ -164,15 +187,16 @@ async function fetchModelsCandidate(
   url: string,
   apiKey: string,
   timeoutMs: number,
+  transport: ModelFetchTransport,
 ): Promise<ModelsApiResponse | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(discoveryTimeout()), timeoutMs);
   try {
-    const res = await fetch(url, {
+    const res = await transport(url, {
       method: 'GET',
       headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
-      redirect: 'manual',
       signal: controller.signal,
+      redirect: 'manual',
     });
     if (res.status >= 300 && res.status < 400) {
       throw new ModelFetchError(res.status, 'Redirects are not allowed');
@@ -180,13 +204,18 @@ async function fetchModelsCandidate(
     if (res.ok) return (await res.json()) as ModelsApiResponse;
     if (res.status === 404 || res.status === 405) return null;
 
-    // A stalled error body must not hide an already-known authentication/HTTP
-    // status, or turn a terminal HTTP error into a retryable timeout.
-    const text = await res.text().catch(() => '');
-    throw new ModelFetchError(res.status, `HTTP ${res.status}: ${text.slice(0, 512)}`);
+    // The provider's body never leaves this module: the status class is all the
+    // caller needs, and an error body can echo credentials or internal detail.
+    await res.body?.cancel().catch(() => undefined);
+    throw new ModelFetchError(res.status, `HTTP ${res.status}`);
   } catch (error) {
     if (error instanceof ModelFetchError) throw error;
     if (controller.signal.aborted) throw controller.signal.reason;
+    // A redirect refusal from the strict transport maps to the same contract a
+    // manual 3xx check produced before it.
+    if (isRejectedRedirectError(error)) {
+      throw new ModelFetchError(302, 'Redirects are not allowed');
+    }
     throw error;
   } finally {
     clearTimeout(timer);

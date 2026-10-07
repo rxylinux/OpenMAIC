@@ -71,8 +71,15 @@ export async function summarizeScenes(
     if (answers === undefined) continue;
     const results = gradeChoiceQuestions(questions, answers);
     for (const r of results) {
-      total += 1;
-      if (r.correct === true) correct += 1;
+      // Only decided verdicts enter the score: an ungraded question (no AI
+      // verdict, or an unverifiable key) is neither correct nor wrong, and
+      // must not drag the completion percentage as if it were marked wrong.
+      if (r.correct === true) {
+        correct += 1;
+        total += 1;
+      } else if (r.correct === false) {
+        total += 1;
+      }
     }
   }
 

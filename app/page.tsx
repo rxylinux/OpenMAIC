@@ -90,6 +90,10 @@ import {
 } from '@/lib/config/feature-flags';
 import { useImportPptx } from '@/lib/import/use-import-pptx';
 import { InteractiveModeButton } from '@/components/generation/interactive-mode-button';
+import {
+  DifficultyPicker,
+  type DifficultyPreference,
+} from '@/components/generation/difficulty-picker';
 import { ProBadge } from '@/components/workbench/ProBadge';
 import { arrivedByProSwap, startProSwap } from '@/lib/workbench/pro-swap';
 import {
@@ -102,6 +106,7 @@ const log = createLogger('Home');
 const WEB_SEARCH_STORAGE_KEY = 'webSearchEnabled';
 const RECENT_OPEN_STORAGE_KEY = 'recentClassroomsOpen';
 const INTERACTIVE_MODE_STORAGE_KEY = 'interactiveModeEnabled';
+const DIFFICULTY_PREFERENCE_STORAGE_KEY = 'quizDifficultyPreference';
 
 // PPTX import is still scaffolding: `useImportPptx` has no `onImported` consumer
 // yet, so the flow only logs the parsed slides. Hide the entry point behind a
@@ -117,6 +122,7 @@ interface FormState {
   webSearch: boolean;
   interactiveMode: boolean;
   vocationalTestMode: boolean;
+  difficultyPreference: DifficultyPreference | null;
 }
 
 const initialFormState: FormState = {
@@ -125,6 +131,7 @@ const initialFormState: FormState = {
   webSearch: false,
   interactiveMode: false,
   vocationalTestMode: false,
+  difficultyPreference: null,
 };
 
 function HomePage() {
@@ -200,9 +207,12 @@ function HomePage() {
     try {
       const savedWebSearch = localStorage.getItem(WEB_SEARCH_STORAGE_KEY);
       const savedInteractiveMode = localStorage.getItem(INTERACTIVE_MODE_STORAGE_KEY);
+      const savedDifficulty = localStorage.getItem(DIFFICULTY_PREFERENCE_STORAGE_KEY);
       const updates: Partial<FormState> = {};
       if (savedWebSearch === 'true') updates.webSearch = true;
       if (savedInteractiveMode === 'true') updates.interactiveMode = true;
+      if (savedDifficulty === 'easy' || savedDifficulty === 'medium' || savedDifficulty === 'hard')
+        updates.difficultyPreference = savedDifficulty;
       if (Object.keys(updates).length > 0) {
         setForm((prev) => ({ ...prev, ...updates }));
       }
@@ -227,20 +237,56 @@ function HomePage() {
   const [error, setError] = useState<string | null>(null);
   // Unmastered mistake count for the top-right pill badge; -1 hides the badge
   // (not loaded yet, or the deployment has no server persistence for it).
+  // Refreshed on mount, on returning to the tab (visibility), and whenever a
+  // capture commits (the mistakes-changed event) — not just once on mount.
   const [mistakeCount, setMistakeCount] = useState(-1);
   useEffect(() => {
     let cancelled = false;
-    void (async () => {
+    // Count race guard (C2 page gate): only the NEWEST issued count request
+    // may land — a slow older response (stale filter, old server state)
+    // must never overwrite a fresher value.
+    let countGeneration = 0;
+    const refresh = async () => {
+      const generation = ++countGeneration;
       try {
-        const { fetchMistakes } = await import('@/lib/mistake-book/client');
-        const result = await fetchMistakes('unmastered');
-        if (!cancelled && result.configured) setMistakeCount(result.mistakes.length);
+        const { fetchMistakeCount } = await import('@/lib/mistake-book/client');
+        const count = await fetchMistakeCount();
+        if (!cancelled && generation === countGeneration && count !== null) {
+          setMistakeCount(count);
+        }
       } catch {
         /* hidden badge is the fallback */
       }
-    })();
+    };
+    void refresh();
+    const onMistakesChanged = () => void refresh();
+    window.addEventListener('openmaic:mistakes-changed', onMistakesChanged);
+    document.addEventListener('visibilitychange', onMistakesChanged);
+    // Outbox lifecycle (R8 delivery review): the HOME page also drives queue
+    // flushes — mount and connectivity-restored — not only the mistake book.
+    const flushQueue = async () => {
+      try {
+        const { flushOutbox } = await import('@/lib/mistake-book/outbox');
+        const report = await flushOutbox();
+        if (report.uploaded.length > 0) {
+          // Durable queue change (concurrent-flush design): broadcast even
+          // from a cancelled caller — with per-instance send coordination a
+          // StrictMode sibling's pass may be the one that uploaded, and the
+          // LIVE badge must still refresh.
+          window.dispatchEvent(new CustomEvent('openmaic:mistakes-changed'));
+          if (!cancelled) void refresh();
+        }
+      } catch {
+        /* retried on the next trigger */
+      }
+    };
+    void flushQueue();
+    window.addEventListener('online', flushQueue);
     return () => {
       cancelled = true;
+      window.removeEventListener('openmaic:mistakes-changed', onMistakesChanged);
+      document.removeEventListener('visibilitychange', onMistakesChanged);
+      window.removeEventListener('online', flushQueue);
     };
   }, []);
   // True while the Generate click drains upload-time ingests and builds the
@@ -368,6 +414,7 @@ function HomePage() {
       revokeThumbnailSlideMediaUrls(thumbnailsRef.current);
       thumbnailsRef.current = {};
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- pre-existing: refs/setters only, mount-scoped
   }, []);
 
   const handleDelete = (id: string, e: React.MouseEvent) => {
@@ -531,6 +578,8 @@ function HomePage() {
       if (field === 'webSearch') localStorage.setItem(WEB_SEARCH_STORAGE_KEY, String(value));
       if (field === 'interactiveMode')
         localStorage.setItem(INTERACTIVE_MODE_STORAGE_KEY, String(value));
+      if (field === 'difficultyPreference')
+        localStorage.setItem(DIFFICULTY_PREFERENCE_STORAGE_KEY, (value as string | null) ?? '');
       if (field === 'requirement') updateRequirementCache(value as string);
     } catch {
       /* ignore */
@@ -631,6 +680,7 @@ function HomePage() {
         webSearch: form.webSearch || undefined,
         interactiveMode: form.vocationalTestMode ? true : form.interactiveMode,
         ...(form.vocationalTestMode ? { taskEngineMode: true } : {}),
+        ...(form.difficultyPreference ? { difficultyPreference: form.difficultyPreference } : {}),
       };
 
       let documentSources: SessionDocumentSource[] | undefined;
@@ -960,6 +1010,26 @@ function HomePage() {
                 </TooltipTrigger>
                 <TooltipContent side="top" className="text-xs">
                   {t('toolbar.interactiveModeHint')}
+                </TooltipContent>
+              </Tooltip>
+
+              {/* Quiz difficulty preference */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <DifficultyPicker
+                    value={form.difficultyPreference}
+                    labels={{
+                      auto: t('toolbar.difficultyAuto'),
+                      easy: t('generation.quizDifficultyEasy'),
+                      medium: t('generation.quizDifficultyMedium'),
+                      hard: t('generation.quizDifficultyHard'),
+                    }}
+                    onChange={(value) => updateForm('difficultyPreference', value)}
+                    disabled={preparingGenerate}
+                  />
+                </TooltipTrigger>
+                <TooltipContent side="top" className="text-xs">
+                  {t('toolbar.difficultyHint')}
                 </TooltipContent>
               </Tooltip>
 

@@ -96,23 +96,25 @@ test.describe('Classroom complete adaptive layout', () => {
     // commits ("a full-aggregate save with no outline means no outline").
     // Wait for the document to land first…
     await expect
-      .poll(() =>
-        page.evaluate(
-          ({ stageId }) =>
-            new Promise<number>((resolve) => {
-              const req = indexedDB.open('maic-documents');
-              req.onsuccess = () => {
-                const tx = req.result.transaction(['stages'], 'readonly');
-                const get = tx.objectStore('stages').get(stageId);
-                get.onsuccess = () => resolve(get.result ? 1 : 0);
-                get.onerror = () => resolve(-1);
-              };
-              req.onerror = () => resolve(-1);
-            }),
-          { stageId: classroomId },
-        ),
+      .poll(
+        () =>
+          page.evaluate(
+            ({ stageId }) =>
+              new Promise<number>((resolve) => {
+                const req = indexedDB.open('maic-documents');
+                req.onsuccess = () => {
+                  const tx = req.result.transaction(['stages'], 'readonly');
+                  const get = tx.objectStore('stages').get(stageId);
+                  get.onsuccess = () => resolve(get.result ? 1 : 0);
+                  get.onerror = () => resolve(-1);
+                };
+                req.onerror = () => resolve(-1);
+              }),
+            { stageId: classroomId },
+          ),
+        { timeout: 15_000 },
       )
-      .toBe(1, { timeout: 15_000 });
+      .toBe(1);
     await page.waitForTimeout(500); // let the aggregate save transaction settle
 
     // …then mark the outline record complete the way the generator would.

@@ -685,3 +685,206 @@ test('real fetch reaches the listening conformance server over loopback', async 
     await networkServer.close();
   }
 });
+// --- guarded status route: EXECUTED client → REAL handler → real store -----
+// The guarded-mapping contract proven end to end: HttpRuntimeStore against
+// the production createRuntimeHttpHandler over a real BrowserRuntimeStore —
+// not handler-only coverage and not the hand-rolled conformance server.
+import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
+import { IDBFactory } from 'fake-indexeddb';
+import { BrowserRuntimeStore } from '../src/runtime/browser.js';
+import { createRuntimeHttpHandler } from '../src/server/index.js';
+import { RuntimeHttpError } from '../src/server/http-error.js';
+import { RuntimeAppendConflictError } from '../src/runtime/types.js';
+import type { RuntimeStore } from '../src/runtime/types.js';
+
+describe('HttpRuntimeStore setSessionStatusIfLatest roundtrip (real handler, real store)', () => {
+  /** Bridge a real RequestListener to a real fetch implementation. */
+  const fetchViaHandler =
+    (handler: RequestListener): typeof globalThis.fetch =>
+    async (input, init) => {
+      const request = new Request(input as RequestInfo, init);
+      const url = new URL(request.url);
+      const body = await request.text();
+      const fakeRequest = {
+        method: request.method,
+        url: `${url.pathname}${url.search}`,
+        headers: Object.fromEntries(request.headers.entries()),
+        async *[Symbol.asyncIterator]() {
+          if (body !== '') yield Buffer.from(body);
+        },
+      } as unknown as IncomingMessage;
+      return new Promise<Response>((resolve, reject) => {
+        let status = 200;
+        let responseHeaders: Record<string, string> = {};
+        let responseBody: string | undefined;
+        let headersSent = false;
+        const fakeResponse = {
+          get headersSent() {
+            return headersSent;
+          },
+          writeHead(nextStatus: number, nextHeaders?: Record<string, string>) {
+            status = nextStatus;
+            responseHeaders = nextHeaders ?? {};
+            headersSent = true;
+            return this;
+          },
+          end(chunk?: string | Buffer) {
+            responseBody = chunk === undefined ? undefined : chunk.toString();
+            resolve(
+              new Response(status === 204 ? null : responseBody, {
+                status,
+                headers: responseHeaders,
+              }),
+            );
+            return this;
+          },
+          destroy(error?: Error) {
+            reject(error ?? new Error('response destroyed'));
+            return this;
+          },
+        } as unknown as ServerResponse;
+        try {
+          handler(fakeRequest, fakeResponse);
+        } catch (error) {
+          reject(error as Error);
+        }
+      });
+    };
+
+  const quizSession = (id: string, createdAt: string): RuntimeSessionInit => ({
+    id,
+    kind: 'quizAttempt',
+    stageId: 'stage-1',
+    learnerKey: 'learner-1',
+    status: 'active',
+    createdAt,
+    updatedAt: createdAt,
+  });
+  const draftPayload = { payloadVersion: 1, phase: 'draft' as const, answers: {} };
+
+  function makeHarness(unsupported = false) {
+    const backing = new BrowserRuntimeStore({ indexedDB: new IDBFactory() });
+    const store: RuntimeStore = unsupported
+      ? (new Proxy(backing, {
+          get(target, prop) {
+            if (prop === 'setSessionStatusIfLatest') return undefined; // unsupported
+            const value = Reflect.get(target, prop, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        }) as RuntimeStore)
+      : backing;
+    const handler = createRuntimeHttpHandler(store, {
+      authenticate: async () => ({ learnerKey: 'learner-1' }),
+    });
+    const client = new HttpRuntimeStore({
+      baseUrl: 'http://guarded-roundtrip.invalid',
+      fetch: fetchViaHandler(handler),
+    });
+    return { backing, store, client };
+  }
+
+  test('TRUE on 204: the guarded write commits through the real chain', async () => {
+    const { backing, client } = makeHarness();
+    await client.createSession(quizSession('roundtrip-root', T0));
+    await client.appendRecord({
+      id: 'roundtrip-root-record',
+      sessionId: 'roundtrip-root',
+      sceneId: 'scene-1',
+      createdAt: T0,
+      payload: draftPayload,
+    });
+
+    await expect(
+      client.setSessionStatusIfLatest!('roundtrip-root', 'completed', '2026-01-02T00:00:00.000Z', {
+        expectedLastSeq: 0,
+        relevantSceneId: 'scene-OTHER',
+      }),
+    ).resolves.toBe(true);
+    expect((await backing.getSession('roundtrip-root'))?.status).toBe('completed'); // real row
+  });
+
+  test('FALSE only for 409 LINEAGE_ADVANCED: a relevant newer sibling refuses, nothing written', async () => {
+    const { backing, client } = makeHarness();
+    await client.createSession(quizSession('roundtrip-root', T0));
+    await client.appendRecord({
+      id: 'roundtrip-root-record',
+      sessionId: 'roundtrip-root',
+      sceneId: 'scene-1',
+      createdAt: T0,
+      payload: draftPayload,
+    });
+    await client.setSessionStatus('roundtrip-root', 'completed', '2026-01-01T00:01:00.000Z');
+    await client.createSession(quizSession('roundtrip-newer', '2026-01-03T00:00:00.000Z'));
+    await client.appendRecord({
+      id: 'roundtrip-newer-record',
+      sessionId: 'roundtrip-newer',
+      sceneId: 'scene-1',
+      createdAt: '2026-01-03T00:00:01.000Z',
+      payload: draftPayload,
+    });
+
+    await expect(
+      client.setSessionStatusIfLatest!('roundtrip-root', 'active', '2026-01-04T00:00:00.000Z', {
+        relevantSceneId: 'scene-1',
+      }),
+    ).resolves.toBe(false);
+    const root = await backing.getSession('roundtrip-root');
+    expect(root?.status).toBe('completed'); // refused: zero unguarded write
+    expect(root?.updatedAt).toBe('2026-01-01T00:01:00.000Z');
+  });
+
+  test('unsupported store: safe 501 thrown, ZERO unguarded fallback write', async () => {
+    const { backing, client } = makeHarness(true);
+    await client.createSession(quizSession('roundtrip-501', T0));
+    await backing.setSessionStatus('roundtrip-501', 'completed', '2026-01-01T00:01:00.000Z');
+
+    const attempt = client.setSessionStatusIfLatest!('roundtrip-501', 'active', T0);
+    await expect(attempt).rejects.toBeInstanceOf(HttpRuntimeStoreError);
+    await expect(attempt).rejects.toMatchObject({
+      status: 501,
+      code: 'LINEAGE_GUARD_UNSUPPORTED',
+    });
+    // The honest refusal must not downgrade to an unguarded write.
+    expect((await backing.getSession('roundtrip-501'))?.status).toBe('completed');
+  });
+
+  test('other conflicts propagate: a stale expectedLastSeq surfaces as RuntimeAppendConflictError', async () => {
+    const { client } = makeHarness();
+    await client.createSession(quizSession('roundtrip-cas', T0));
+    await client.appendRecord({
+      id: 'roundtrip-cas-record',
+      sessionId: 'roundtrip-cas',
+      sceneId: 'scene-1',
+      createdAt: T0,
+      payload: draftPayload,
+    });
+
+    await expect(
+      client.setSessionStatusIfLatest!('roundtrip-cas', 'completed', T0, {
+        expectedLastSeq: 7, // stale on purpose
+      }),
+    ).rejects.toBeInstanceOf(RuntimeAppendConflictError);
+  });
+
+  test('other internal errors propagate REDACTED through the real chain', async () => {
+    const secret = 'dsn=postgres://do-not-reflect';
+    const failing = {
+      getSession: async () => {
+        throw new RuntimeHttpError(500, 'DB_INTERNAL', secret, { dsn: secret });
+      },
+    } as unknown as RuntimeStore;
+    const handler = createRuntimeHttpHandler(failing, {
+      authenticate: async () => ({ learnerKey: 'learner-1' }),
+    });
+    const client = new HttpRuntimeStore({
+      baseUrl: 'http://guarded-roundtrip.invalid',
+      fetch: fetchViaHandler(handler),
+    });
+
+    await expect(client.getSession('any-session')).rejects.toMatchObject({
+      status: 500,
+      code: 'INTERNAL_ERROR',
+      message: '@openmaic/storage: internal server error',
+    });
+  });
+});

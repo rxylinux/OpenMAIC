@@ -10,6 +10,8 @@ import type {
   ImageGenerationOptions,
   ImageGenerationResult,
 } from '../types';
+import { mediaFetchFor } from '../media-fetch';
+import { isRejectedRedirectError } from '@/lib/utils/rejected-redirect';
 import { requireModel } from '../require-model';
 
 const DEFAULT_MODEL = 'gpt-image-2';
@@ -27,9 +29,10 @@ export async function testOpenAIImageConnectivity(
   config: ImageGenerationConfig,
 ): Promise<{ success: boolean; message: string }> {
   const baseUrl = normalizeBaseUrl(config.baseUrl);
+  const fetchImpl = mediaFetchFor(config);
 
   try {
-    const response = await fetch(
+    const response = await fetchImpl(
       `${baseUrl}/models/${encodeURIComponent(config.model || DEFAULT_MODEL)}`,
       {
         redirect: 'manual',
@@ -43,9 +46,10 @@ export async function testOpenAIImageConnectivity(
       return { success: true, message: 'Connected to OpenAI Image' };
     }
 
-    const text = await response.text().catch(() => response.statusText);
+    // Fixed text only: the provider's body never reaches the caller.
+    await response.body?.cancel().catch(() => undefined);
     if (response.status === 401 || response.status === 403) {
-      return { success: false, message: `OpenAI Image auth failed (${response.status}): ${text}` };
+      return { success: false, message: `OpenAI Image auth failed (${response.status})` };
     }
     if (response.status === 404) {
       return {
@@ -53,9 +57,15 @@ export async function testOpenAIImageConnectivity(
         message: `OpenAI Image model not found: ${config.model || DEFAULT_MODEL}`,
       };
     }
-    return { success: false, message: `OpenAI Image API error (${response.status}): ${text}` };
+    return { success: false, message: `OpenAI Image API error (${response.status})` };
   } catch (err) {
-    return { success: false, message: `OpenAI Image connectivity error: ${err}` };
+    if (isRejectedRedirectError(err)) {
+      return {
+        success: false,
+        message: 'OpenAI Image connectivity error: Redirects are not allowed',
+      };
+    }
+    return { success: false, message: 'OpenAI Image connectivity error: request failed' };
   }
 }
 
@@ -64,11 +74,12 @@ export async function generateWithOpenAIImage(
   options: ImageGenerationOptions,
 ): Promise<ImageGenerationResult> {
   const baseUrl = normalizeBaseUrl(config.baseUrl);
+  const fetchImpl = mediaFetchFor(config);
   const model = requireModel(config.model, 'OpenAI Image');
   const width = options.width || 1024;
   const height = options.height || 1024;
 
-  const response = await fetch(`${baseUrl}/images/generations`, {
+  const response = await fetchImpl(`${baseUrl}/images/generations`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

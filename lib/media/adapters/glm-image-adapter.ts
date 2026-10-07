@@ -13,6 +13,7 @@ import type {
   ImageGenerationOptions,
   ImageGenerationResult,
 } from '../types';
+import { mediaFetchFor } from '../media-fetch';
 import { probeAuth } from '../probe-auth';
 import { requireModel } from '../require-model';
 
@@ -55,10 +56,11 @@ export async function testGlmImageConnectivity(
   config: ImageGenerationConfig,
 ): Promise<{ success: boolean; message: string }> {
   const baseUrl = normalizeBaseUrl(config.baseUrl);
+  const fetchImpl = mediaFetchFor(config);
   return probeAuth({
     providerName: 'GLM Image',
     request: () =>
-      fetch(`${baseUrl}/images/generations`, {
+      fetchImpl(`${baseUrl}/images/generations`, {
         method: 'POST',
         redirect: 'manual',
         headers: {
@@ -79,8 +81,9 @@ export async function generateWithGlmImage(
   options: ImageGenerationOptions,
 ): Promise<ImageGenerationResult> {
   const baseUrl = normalizeBaseUrl(config.baseUrl);
+  const fetchImpl = mediaFetchFor(config);
 
-  const response = await fetch(`${baseUrl}/images/generations`, {
+  const response = await fetchImpl(`${baseUrl}/images/generations`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

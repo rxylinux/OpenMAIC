@@ -32,6 +32,7 @@ import type {
   VideoGenerationOptions,
   VideoGenerationResult,
 } from '../types';
+import { mediaFetchFor } from '../media-fetch';
 import { probeAuth } from '../probe-auth';
 import { runPolledTask } from '../polled-task';
 import { requireModel } from '../require-model';
@@ -124,14 +125,18 @@ export async function testSeedanceConnectivity(
   config: VideoGenerationConfig,
 ): Promise<{ success: boolean; message: string }> {
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
+  const fetchImpl = mediaFetchFor(config);
   return probeAuth({
     providerName: 'Seedance',
     request: () =>
-      fetch(`${resolveArkRoot(baseUrl)}/contents/generations/tasks/connectivity-test-nonexistent`, {
-        method: 'GET',
-        redirect: 'manual',
-        headers: { Authorization: `Bearer ${config.apiKey}` },
-      }),
+      fetchImpl(
+        `${resolveArkRoot(baseUrl)}/contents/generations/tasks/connectivity-test-nonexistent`,
+        {
+          method: 'GET',
+          redirect: 'manual',
+          headers: { Authorization: `Bearer ${config.apiKey}` },
+        },
+      ),
   });
 }
 
@@ -140,6 +145,7 @@ export async function submitSeedanceTask(
   options: VideoGenerationOptions,
 ): Promise<string> {
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
+  const fetchImpl = mediaFetchFor(config);
 
   const body: Record<string, unknown> = {
     model: requireModel(config.model, 'Seedance'),
@@ -160,7 +166,7 @@ export async function submitSeedanceTask(
   const resolution = toSeedanceResolution(options.resolution);
   if (resolution) body.resolution = resolution;
 
-  const response = await fetch(`${resolveArkRoot(baseUrl)}/contents/generations/tasks`, {
+  const response = await fetchImpl(`${resolveArkRoot(baseUrl)}/contents/generations/tasks`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -192,13 +198,17 @@ export async function pollSeedanceTask(
   taskId: string,
 ): Promise<VideoGenerationResult | null> {
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
+  const fetchImpl = mediaFetchFor(config);
 
-  const response = await fetch(`${resolveArkRoot(baseUrl)}/contents/generations/tasks/${taskId}`, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${config.apiKey}`,
+  const response = await fetchImpl(
+    `${resolveArkRoot(baseUrl)}/contents/generations/tasks/${taskId}`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+      },
     },
-  });
+  );
 
   if (!response.ok) {
     const text = await response.text();

@@ -1,8 +1,20 @@
 import { NextRequest } from 'next/server';
 import { createLogger } from '@/lib/logger';
-import { validateUrlForSSRF } from '@/lib/server/ssrf-guard';
+import { validatePublicUrlForSSRF } from '@/lib/server/ssrf-guard';
 import { apiError, apiSuccess } from '@/lib/server/api-response';
+import { providerFetch, type ProviderFetchPolicy } from '@/lib/server/provider-fetch';
 const log = createLogger('Azure Voices');
+
+// The voice-list base URL is explicit request input: strict public policy at
+// connect (private/loopback/CGNAT and metadata refused regardless of the
+// operator opt-in), connect address pinned to the vetted DNS answers, and a 3xx
+// refused rather than followed.
+const VOICES_POLICY: ProviderFetchPolicy = { allowLocalNetworks: false, rejectRedirects: true };
+
+// Fixed messages: the target's status, body and transport errors are logged
+// server-side only and never echoed back to the caller.
+const AUTH_FAILED_MESSAGE = 'Authentication failed, please check the API Key';
+const FETCH_FAILED_MESSAGE = 'Failed to fetch voices from Azure';
 
 export const maxDuration = 30;
 
@@ -25,45 +37,57 @@ export async function POST(req: NextRequest) {
       return apiError('MISSING_REQUIRED_FIELD', 400, 'Base URL is required');
     }
 
-    // Validate baseUrl against SSRF
-    const ssrfError = await validateUrlForSSRF(baseUrl);
+    // The voice-list base URL is always caller-supplied request input: the
+    // strict public policy applies at validation and at connect, so the
+    // operator's ALLOW_LOCAL_NETWORKS opt-in is not inherited by it.
+    const ssrfError = await validatePublicUrlForSSRF(baseUrl);
     if (ssrfError) {
       return apiError('INVALID_URL', 403, ssrfError);
     }
 
-    // Call Azure voices list endpoint; disable redirect following to prevent SSRF via redirect
-    const response = await fetch(`${baseUrl}/cognitiveservices/voices/list`, {
-      method: 'GET',
-      headers: {
-        'Ocp-Apim-Subscription-Key': apiKey,
+    // Call Azure voices list endpoint through the strict provider transport
+    // (connect-time DNS pinning; redirects refused).
+    const response = await providerFetch(
+      `${baseUrl}/cognitiveservices/voices/list`,
+      {
+        method: 'GET',
+        headers: {
+          'Ocp-Apim-Subscription-Key': apiKey,
+        },
+        signal: AbortSignal.timeout(20_000),
       },
-      redirect: 'manual',
-    });
+      VOICES_POLICY,
+    );
 
-    if (response.status >= 300 && response.status < 400) {
-      return apiError('REDIRECT_NOT_ALLOWED', 403, 'Redirects are not allowed');
+    if (response.status === 401 || response.status === 403) {
+      log.warn(`Azure voices list rejected credentials [status=${response.status}]`);
+      await response.body?.cancel().catch(() => undefined);
+      return apiError('UPSTREAM_ERROR', 502, AUTH_FAILED_MESSAGE);
     }
 
     if (!response.ok) {
-      const errorText = await response.text();
-      return apiError(
-        'UPSTREAM_ERROR',
-        response.status,
-        'Failed to fetch voices from Azure',
-        errorText || response.statusText,
-      );
+      log.warn(`Azure voices list failed [status=${response.status}]`);
+      await response.body?.cancel().catch(() => undefined);
+      return apiError('UPSTREAM_ERROR', 502, FETCH_FAILED_MESSAGE);
     }
 
-    const voices = await response.json();
+    // Only a JSON array is a voice list; anything else (an HTML error page, a
+    // JSON object) is logged and refused without its body reaching the caller.
+    let voices: unknown;
+    try {
+      voices = await response.json();
+    } catch (error) {
+      log.warn('Azure voices list returned a non-JSON body:', error);
+      return apiError('UPSTREAM_ERROR', 502, FETCH_FAILED_MESSAGE);
+    }
+    if (!Array.isArray(voices)) {
+      log.warn(`Azure voices list returned ${typeof voices} instead of an array`);
+      return apiError('UPSTREAM_ERROR', 502, FETCH_FAILED_MESSAGE);
+    }
 
     return apiSuccess({ voices });
   } catch (error) {
     log.error(`Azure voices fetch failed [baseUrl="${baseUrl ?? 'unknown'}"]:`, error);
-    return apiError(
-      'INTERNAL_ERROR',
-      500,
-      'Failed to fetch voices',
-      error instanceof Error ? error.message : 'Unknown error',
-    );
+    return apiError('INTERNAL_ERROR', 500, FETCH_FAILED_MESSAGE);
   }
 }

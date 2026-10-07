@@ -28,6 +28,7 @@ export interface UserRequirements {
   webSearch?: boolean;
   interactiveMode?: boolean;
   taskEngineMode?: boolean;
+  difficultyPreference?: 'easy' | 'medium' | 'hard';
 }
 
 export interface WidgetOutline {

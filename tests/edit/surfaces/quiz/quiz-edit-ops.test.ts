@@ -108,6 +108,15 @@ describe('question factories + list ops', () => {
     const c1 = updateQuestion(c0, 'q1', { points: 5, analysis: 'because' });
     expect(c1.questions[0]).toMatchObject({ points: 5, analysis: 'because' });
   });
+
+  it('updateQuestion patches the knowledge point and leaves it untouched otherwise', () => {
+    const c0 = content(choiceQuestion());
+    const c1 = updateQuestion(c0, 'q1', { knowledgePoint: '法国首都' });
+    expect(c1.questions[0]!.knowledgePoint).toBe('法国首都');
+    // An unrelated patch must not clear a point the author just entered.
+    const c2 = updateQuestion(c1, 'q1', { points: 2 });
+    expect(c2.questions[0]!.knowledgePoint).toBe('法国首都');
+  });
 });
 
 describe('setQuestionType transitions', () => {

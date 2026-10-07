@@ -39,10 +39,9 @@ describe('resolveModel — installs the redirect-validating transport on every m
     mocks.serverManaged = false;
   });
 
-  it('passes fetchWithRedirectValidation as the fetch implementation for a client-supplied base URL', async () => {
+  it('passes the strict-public pinned fetch for a client-supplied base URL', async () => {
     const { resolveModel } = await import('@/lib/server/resolve-model');
-    const { fetchWithRedirectValidation } =
-      await import('@/lib/server/fetch-with-redirect-validation');
+    const { clientBaseUrlLlmFetch } = await import('@/lib/server/llm-provider-fetch');
     await resolveModel({
       modelString: 'openai:gpt-5.4-mini',
       apiKey: 'client-key',
@@ -51,15 +50,14 @@ describe('resolveModel — installs the redirect-validating transport on every m
 
     expect(mocks.getModelCalls.at(-1)).toMatchObject({
       baseUrl: 'https://8.8.8.8/v1',
-      fetchImpl: fetchWithRedirectValidation,
+      fetchImpl: clientBaseUrlLlmFetch,
     });
   });
 
-  it('keeps the same hop re-validation for managed providers, whose origin is operator-trusted but whose redirects are not', async () => {
+  it('keeps hop re-validation for managed providers on the pinned operator transport', async () => {
     mocks.serverManaged = true;
     const { resolveModel } = await import('@/lib/server/resolve-model');
-    const { fetchWithRedirectValidation } =
-      await import('@/lib/server/fetch-with-redirect-validation');
+    const { operatorLlmFetch } = await import('@/lib/server/llm-provider-fetch');
     await resolveModel({
       modelString: 'openai:gpt-5.4-mini',
       apiKey: 'server-key',
@@ -67,6 +65,6 @@ describe('resolveModel — installs the redirect-validating transport on every m
 
     const call = mocks.getModelCalls.at(-1)!;
     expect(call.baseUrl).toBeUndefined();
-    expect(call.fetchImpl).toBe(fetchWithRedirectValidation);
+    expect(call.fetchImpl).toBe(operatorLlmFetch);
   });
 });

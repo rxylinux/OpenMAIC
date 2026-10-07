@@ -133,7 +133,10 @@ describe('gradeChoiceQuestions: consumer paths', () => {
       points: 10,
     };
     const results = gradeChoiceQuestions([question], { q3: 'A' });
-    expect(results[0].correct).toBe(false);
+    // R5 fail-closed: an unverifiable key is not "wrong", it is NO verdict —
+    // strictly stronger than the old "not silently correct".
+    expect(results[0].correct).toBeNull();
+    expect(results[0].status).toBe('ungraded');
   });
 
   test('compatibility resolution applies to the persisted key only (negative)', () => {

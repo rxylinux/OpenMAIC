@@ -14,8 +14,13 @@ import {
   resolveBaseUrl,
   resolveProxy,
 } from '@/lib/server/provider-config';
-import { validateUrlForSSRF } from '@/lib/server/ssrf-guard';
-import { fetchWithRedirectValidation } from '@/lib/server/fetch-with-redirect-validation';
+import { validatePublicUrlForSSRF, validateUrlForSSRF } from '@/lib/server/ssrf-guard';
+import {
+  clientBaseUrlLlmFetch,
+  clientCatalogDefaultLlmFetch,
+  createProxyLlmFetch,
+  operatorLlmFetch,
+} from '@/lib/server/llm-provider-fetch';
 import { getStageRoute, type LlmStage } from '@/lib/server/model-routes';
 
 export interface ResolvedModel extends ModelWithInfo {
@@ -106,16 +111,51 @@ export async function resolveModel(params: {
     throw new Error('Amazon Bedrock must be enabled by the server operator before it can be used.');
   }
   const clientBaseUrl = managed ? undefined : clientBaseUrlParam || undefined;
+  // Trust matrix for an unmanaged provider's endpoint:
+  //  - the caller picked the model (x-model) or sent a base URL ⇒ the endpoint
+  //    is caller-chosen: either the client-supplied URL or the provider's
+  //    catalog default (e.g. a localhost Ollama);
+  //  - only the operator picked the model (a MODEL_ROUTES stage route or
+  //    DEFAULT_MODEL) with no client base URL ⇒ the endpoint is
+  //    operator-selected and resolves purely from server config.
+  const operatorSelected = Boolean(stageModel) || !params.modelString;
+  const clientEndpoint = !managed && (Boolean(clientBaseUrl) || !operatorSelected);
+  // A URL from the request body is arbitrary caller input: validate it under
+  // the strict public policy so the operator's ALLOW_LOCAL_NETWORKS opt-in
+  // (which exists for *their* endpoints) cannot be inherited by client input.
   if (clientBaseUrl) {
-    const ssrfError = await validateUrlForSSRF(clientBaseUrl);
+    const ssrfError = await validatePublicUrlForSSRF(clientBaseUrl);
     if (ssrfError) {
       throw new Error(ssrfError);
+    }
+  }
+  // A caller-chosen provider's catalog default is a code constant, not caller
+  // input: the operator policy applies, so a self-hosted deployment with the
+  // local-network opt-in keeps working when the caller names an unmanaged
+  // provider without sending a base URL.
+  if (clientEndpoint && !clientBaseUrl) {
+    const catalogDefault = getProvider(providerId)?.defaultBaseUrl;
+    if (catalogDefault) {
+      const ssrfError = await validateUrlForSSRF(catalogDefault);
+      if (ssrfError) {
+        throw new Error(ssrfError);
+      }
     }
   }
 
   const apiKey = resolveApiKey(providerId, clientApiKey || '');
   const baseUrl = resolveBaseUrl(providerId, clientBaseUrl);
   const proxy = resolveProxy(providerId);
+  // A proxied request resolves the target hostname at the proxy, so there is no
+  // connect-time pin equivalent for a caller-chosen endpoint behind a proxy:
+  // fail closed. Operator-selected endpoints keep the proxy (the proxy and the
+  // endpoint are both operator configuration) with per-hop redirect validation.
+  if (proxy && clientEndpoint) {
+    throw new Error(
+      'A caller-chosen provider endpoint cannot be used through the server proxy. ' +
+        'Use a server-configured endpoint or remove the proxy for this provider.',
+    );
+  }
   const { model, modelInfo } = getModel({
     providerId,
     modelId,
@@ -123,9 +163,20 @@ export async function resolveModel(params: {
     baseUrl,
     proxy,
     providerType: clientProviderType as ProviderType | undefined,
-    // Re-validate every redirect hop of the outbound request (see
-    // fetchWithRedirectValidation); the base URL above is checked at origin.
-    fetchImpl: fetchWithRedirectValidation,
+    // Transport follows the same trust matrix: a body-supplied base URL rides
+    // the strict-public pinned transport; a caller-chosen catalog default
+    // (code constant) rides the pinned transport under the operator address
+    // policy; an operator endpoint behind an operator proxy rides the proxy
+    // transport with per-hop validation; every other operator endpoint rides
+    // the pinned operator transport (per-hop redirect validation plus
+    // connect-time pinning and the 15-minute budget).
+    fetchImpl: proxy
+      ? createProxyLlmFetch(proxy)
+      : clientBaseUrl
+        ? clientBaseUrlLlmFetch
+        : clientEndpoint
+          ? clientCatalogDefaultLlmFetch
+          : operatorLlmFetch,
   });
 
   // Thinking arbitration mirrors model routing — the route carries a full

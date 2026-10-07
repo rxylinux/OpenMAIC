@@ -23,6 +23,8 @@ import type {
   VideoGenerationOptions,
   VideoGenerationResult,
 } from '../types';
+import { mediaFetchFor } from '../media-fetch';
+import type { MediaProviderFetch } from '../types';
 import { probeAuth } from '../probe-auth';
 import { runPolledTask } from '../polled-task';
 import { requireModel } from '../require-model';
@@ -130,12 +132,13 @@ export async function testKlingConnectivity(
   config: VideoGenerationConfig,
 ): Promise<{ success: boolean; message: string }> {
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
+  const fetchImpl = mediaFetchFor(config);
   return probeAuth({
     providerName: 'Kling',
     request: () => {
       const { accessKey, secretKey } = parseApiKey(config.apiKey);
       const token = generateJWT(accessKey, secretKey);
-      return fetch(`${baseUrl}/v1/videos/text2video/connectivity-test`, {
+      return fetchImpl(`${baseUrl}/v1/videos/text2video/connectivity-test`, {
         method: 'GET',
         redirect: 'manual',
         headers: { Authorization: `Bearer ${token}` },
@@ -149,6 +152,7 @@ export async function testKlingConnectivity(
 // ---------------------------------------------------------------------------
 
 async function submitTask(
+  fetchImpl: MediaProviderFetch,
   baseUrl: string,
   token: string,
   model: string,
@@ -164,7 +168,7 @@ async function submitTask(
   if (options.duration) body.duration = String(options.duration);
   if (options.aspectRatio) body.aspect_ratio = options.aspectRatio;
 
-  const response = await fetch(`${baseUrl}/v1/videos/text2video`, {
+  const response = await fetchImpl(`${baseUrl}/v1/videos/text2video`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -194,11 +198,12 @@ async function submitTask(
 // ---------------------------------------------------------------------------
 
 async function pollTask(
+  fetchImpl: MediaProviderFetch,
   baseUrl: string,
   token: string,
   taskId: string,
 ): Promise<KlingPollResponse['data']> {
-  const response = await fetch(`${baseUrl}/v1/videos/text2video/${taskId}`, {
+  const response = await fetchImpl(`${baseUrl}/v1/videos/text2video/${taskId}`, {
     method: 'GET',
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -226,16 +231,17 @@ export async function generateWithKling(
 ): Promise<VideoGenerationResult> {
   const model = requireModel(config.model, 'Kling');
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
+  const fetchImpl = mediaFetchFor(config);
   const { accessKey, secretKey } = parseApiKey(config.apiKey);
   const token = generateJWT(accessKey, secretKey);
 
   return runPolledTask<VideoGenerationResult>({
     submit: async () => ({
       status: 'submitted',
-      taskId: await submitTask(baseUrl, token, model, options),
+      taskId: await submitTask(fetchImpl, baseUrl, token, model, options),
     }),
     poll: async (taskId) => {
-      const result = await pollTask(baseUrl, token, taskId);
+      const result = await pollTask(fetchImpl, baseUrl, token, taskId);
 
       if (result.task_status === 'succeed') {
         const video = result.task_result?.videos?.[0];

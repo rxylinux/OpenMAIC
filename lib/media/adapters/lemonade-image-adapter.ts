@@ -9,6 +9,8 @@ import type {
   ImageGenerationOptions,
   ImageGenerationResult,
 } from '../types';
+import { mediaFetchFor } from '../media-fetch';
+import { isRejectedRedirectError } from '@/lib/utils/rejected-redirect';
 import { requireModel } from '../require-model';
 
 const DEFAULT_BASE_URL = 'http://localhost:13305/v1';
@@ -30,9 +32,10 @@ export async function testLemonadeImageConnectivity(
   config: ImageGenerationConfig,
 ): Promise<{ success: boolean; message: string }> {
   const baseUrl = normalizeBaseUrl(config.baseUrl);
+  const fetchImpl = mediaFetchFor(config);
 
   try {
-    const response = await fetch(`${baseUrl}/models`, {
+    const response = await fetchImpl(`${baseUrl}/models`, {
       redirect: 'manual',
       headers: authHeaders(config.apiKey),
     });
@@ -41,10 +44,14 @@ export async function testLemonadeImageConnectivity(
       return { success: true, message: 'Connected to Lemonade image generation' };
     }
 
-    const text = await response.text().catch(() => response.statusText);
-    return { success: false, message: `Lemonade API error (${response.status}): ${text}` };
+    // Fixed text only: the provider's body never reaches the caller.
+    await response.body?.cancel().catch(() => undefined);
+    return { success: false, message: `Lemonade API error (${response.status})` };
   } catch (err) {
-    return { success: false, message: `Lemonade connectivity error: ${err}` };
+    if (isRejectedRedirectError(err)) {
+      return { success: false, message: 'Lemonade connectivity error: Redirects are not allowed' };
+    }
+    return { success: false, message: 'Lemonade connectivity error: request failed' };
   }
 }
 
@@ -53,10 +60,11 @@ export async function generateWithLemonadeImage(
   options: ImageGenerationOptions,
 ): Promise<ImageGenerationResult> {
   const baseUrl = normalizeBaseUrl(config.baseUrl);
+  const fetchImpl = mediaFetchFor(config);
   const width = options.width || 1024;
   const height = options.height || 1024;
 
-  const response = await fetch(`${baseUrl}/images/generations`, {
+  const response = await fetchImpl(`${baseUrl}/images/generations`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

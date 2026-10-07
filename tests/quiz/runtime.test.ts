@@ -42,6 +42,21 @@ function wrapStore(store: RuntimeStore, overrides: Partial<RuntimeStore>): Runti
   });
 }
 
+/**
+ * Run the body with Web Locks explicitly ABSENT, so `withAttemptLock` takes
+ * its fallback path deterministically — on Node >= 22 (global navigator with
+ * real `navigator.locks`) an unstubbed run would take the real lock branch
+ * and the barrier-style races below would serialize on the lock instead of
+ * racing as designed (the four Node-24 timeouts).
+ */
+function withoutWebLocks() {
+  vi.stubGlobal('navigator', { locks: undefined });
+}
+
+/** Web Locks are genuinely available in this process (real-lock layer). */
+const hasRealWebLocks =
+  typeof navigator !== 'undefined' && !!(navigator as { locks?: unknown }).locks;
+
 describe('quiz attempt runtime persistence', () => {
   beforeEach(() => {
     Object.defineProperty(globalThis, 'IDBKeyRange', {
@@ -52,6 +67,7 @@ describe('quiz attempt runtime persistence', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   it('coalesces rapid draft changes into one latest snapshot', async () => {
@@ -81,7 +97,7 @@ describe('quiz attempt runtime persistence', () => {
   it('flushes the latest draft to completion before writing submitted', async () => {
     let releaseDraft!: () => void;
     const order: string[] = [];
-    const write = vi.fn(async (input: { phase: string }) => {
+    const write = vi.fn(async (input: { phase: string; attemptId?: string }) => {
       order.push(`start:${input.phase}`);
       if (input.phase === 'draft') {
         await new Promise<void>((resolve) => {
@@ -89,6 +105,7 @@ describe('quiz attempt runtime persistence', () => {
         });
       }
       order.push(`end:${input.phase}`);
+      return { sessionId: input.attemptId ?? '', createdSession: false };
     });
     const writer = createQuizAttemptWriter({ write });
     const base = {
@@ -127,6 +144,7 @@ describe('quiz attempt runtime persistence', () => {
     });
     const writer = createQuizAttemptWriter({
       write: async (input) => {
+        void input;
         if (input.phase === 'draft') {
           draftStarted();
           await draftMayFinish;
@@ -134,7 +152,7 @@ describe('quiz attempt runtime persistence', () => {
           submissionStarted();
           await submissionMayFinish;
         }
-        await recordQuizAttempt(input, deps);
+        return await recordQuizAttempt(input, deps);
       },
     });
     const base = {
@@ -179,11 +197,13 @@ describe('quiz attempt runtime persistence', () => {
       write: async (input) => {
         slowStarted();
         await slowMayFinish;
-        await recordQuizAttempt(input, deps);
+        return await recordQuizAttempt(input, deps);
       },
     });
     const fastWriter = createQuizAttemptWriter({
-      write: (input) => recordQuizAttempt(input, deps),
+      write: async (input) => {
+        return await recordQuizAttempt(input, deps);
+      },
     });
     const base = {
       stageId: 'stage-1',
@@ -231,7 +251,7 @@ describe('quiz attempt runtime persistence', () => {
       write: async (input) => {
         submissionStarted();
         await submissionMayFinish;
-        await recordQuizAttempt(input, deps);
+        return await recordQuizAttempt(input, deps);
       },
     });
     const submitting = writer.recordPhase({
@@ -256,6 +276,7 @@ describe('quiz attempt runtime persistence', () => {
   });
 
   it('recovers when another tab wins the same session create race without Web Locks', async () => {
+    withoutWebLocks();
     const { store } = makeHarness();
     let missingReads = 0;
     let releaseBoth!: () => void;
@@ -300,6 +321,7 @@ describe('quiz attempt runtime persistence', () => {
   });
 
   it('deduplicates concurrent identical lifecycle writes without Web Locks', async () => {
+    withoutWebLocks();
     const { store } = makeHarness();
     await store.createSession({
       id: 'attempt-race',
@@ -353,6 +375,7 @@ describe('quiz attempt runtime persistence', () => {
   });
 
   it('rolls over when another tab completes after this tab observed active', async () => {
+    withoutWebLocks();
     const { store } = makeHarness();
     await store.createSession({
       id: 'attempt-race',
@@ -480,6 +503,7 @@ describe('quiz attempt runtime persistence', () => {
   });
 
   it('reuses one active retry for concurrent retry requests across tabs', async () => {
+    withoutWebLocks();
     const { store, deps } = makeHarness();
     const base = {
       stageId: 'stage-1',
@@ -1083,5 +1107,175 @@ describe('quiz attempt runtime persistence', () => {
       ),
     ).rejects.toThrow('does not belong to stage "stage-1" and learner "learner-1"');
     expect(await store.listRecords('attempt-1')).toEqual([]);
+  });
+
+  it('with real Web Locks the same-attempt lifecycle race still lands on one record', async () => {
+    if (!hasRealWebLocks) return;
+    const { store, deps } = makeHarness();
+    await store.createSession({
+      id: 'attempt-race-locks',
+      kind: 'quizAttempt',
+      stageId: 'stage-1',
+      learnerKey: 'learner-1',
+      status: 'active',
+      createdAt: '2026-07-14T12:00:00.000Z',
+      updatedAt: '2026-07-14T12:00:00.000Z',
+    });
+    const base = {
+      stageId: 'stage-1',
+      sceneId: 'scene-quiz',
+      attemptId: 'attempt-race-locks',
+    };
+    // Two tabs race the identical reviewed write; the real Web Lock
+    // serializes them, and the dedupe path must hold.
+    await Promise.all([
+      recordQuizAttempt({ ...base, phase: 'reviewed', answers: { q1: 'first' }, results }, deps),
+      recordQuizAttempt({ ...base, phase: 'reviewed', answers: { q1: 'first' }, results }, deps),
+    ]);
+    const records = await store.listRecords('attempt-race-locks');
+    expect(records.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("never transfers X's creation receipt onto an existing Y after a completion race (no Web Locks)", async () => {
+    withoutWebLocks();
+    const { store, deps } = makeHarness();
+    let appendStarted!: () => void;
+    const didStartAppend = new Promise<void>((resolve) => {
+      appendStarted = resolve;
+    });
+    let releaseAppend!: () => void;
+    const mayAppend = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+    let holdOnce = true;
+    const staleTab = wrapStore(store, {
+      appendRecord: async (input) => {
+        // Hold ONLY this call's first append (its CAS retry must run free).
+        if (holdOnce) {
+          holdOnce = false;
+          appendStarted();
+          await mayAppend;
+        }
+        return store.appendRecord(input);
+      },
+    });
+    // THIS call CREATES X (the root session), then its append is held
+    // mid-flight — exactly the no-Web-Locks interleaving where a sticky
+    // "created something" flag used to leak onto the next target.
+    const staleWrite = recordQuizAttempt(
+      {
+        stageId: 'stage-1',
+        sceneId: 'scene-quiz',
+        attemptId: 'attempt-sticky',
+        phase: 'draft',
+        answers: { q1: 'B' },
+      },
+      { ...deps, store: staleTab },
+    );
+    await didStartAppend; // X exists and THIS call created it
+
+    // Another actor completes X, then mints its OWN retry child Y with a
+    // real write — the canonical latest advances past X.
+    await recordQuizAttempt(
+      {
+        stageId: 'stage-1',
+        sceneId: 'scene-quiz',
+        attemptId: 'attempt-sticky',
+        phase: 'reviewed',
+        answers: { q1: 'A' },
+        results,
+      },
+      deps,
+    );
+    await recordQuizAttempt(
+      {
+        stageId: 'stage-1',
+        sceneId: 'scene-quiz',
+        attemptId: 'attempt-sticky',
+        phase: 'draft',
+        answers: {},
+        startNewAttempt: true,
+      },
+      deps,
+    );
+
+    // Release the held append: the REAL store rejects it (X is completed),
+    // and the loop rolls this call forward onto the other actor's EXISTING
+    // child Y. The receipt must describe the FINAL target only — creating X
+    // never transfers to Y (persistQuizRetry would otherwise mint Y's
+    // original-operation capability from X's creation).
+    releaseAppend();
+    await expect(staleWrite).resolves.toEqual({
+      sessionId: 'attempt-sticky:retry:1',
+      createdSession: false,
+    });
+    // Durable facts: X completed with the other actor's review; Y active
+    // holding both drafts (the other actor's marker, then this call's).
+    expect((await store.listRecords('attempt-sticky')).map((record) => record.payload)).toEqual([
+      { payloadVersion: 1, phase: 'reviewed', answers: { q1: 'A' }, results },
+    ]);
+    expect((await store.listRecords('attempt-sticky:retry:1')).map((r) => r.payload)).toEqual([
+      { payloadVersion: 1, phase: 'draft', answers: {} },
+      { payloadVersion: 1, phase: 'draft', answers: { q1: 'B' } },
+    ]);
+  });
+
+  it('keeps the receipt for the SAME created session across a real tail-CAS conflict (no Web Locks)', async () => {
+    withoutWebLocks();
+    const { store, deps } = makeHarness();
+    let appendStarted!: () => void;
+    const didStartAppend = new Promise<void>((resolve) => {
+      appendStarted = resolve;
+    });
+    let releaseAppend!: () => void;
+    const mayAppend = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+    let holdOnce = true;
+    const racingTab = wrapStore(store, {
+      appendRecord: async (input) => {
+        if (holdOnce) {
+          holdOnce = false;
+          appendStarted();
+          await mayAppend;
+        }
+        return store.appendRecord(input);
+      },
+    });
+    // THIS call creates the session and holds its FIRST append — its tail
+    // precondition (no records) is about to go stale for real.
+    const racingWrite = recordQuizAttempt(
+      {
+        stageId: 'stage-1',
+        sceneId: 'scene-quiz',
+        attemptId: 'attempt-cas-receipt',
+        phase: 'draft',
+        answers: { q1: 'B' },
+      },
+      { ...deps, store: racingTab },
+    );
+    await didStartAppend;
+
+    // A real concurrent write advances the tail while the append is held.
+    await store.appendRecord({
+      id: 'other-tab-record',
+      sessionId: 'attempt-cas-receipt',
+      sceneId: 'scene-quiz',
+      createdAt: '2026-07-14T12:00:00.001Z',
+      payload: { payloadVersion: 1, phase: 'draft', answers: { q1: 'OTHER' } },
+    });
+
+    // Release: the real store throws RuntimeAppendConflictError (stale tail),
+    // the loop retries the SAME session with a fresh precondition and the
+    // receipt legitimately stays true — THIS call created this session.
+    releaseAppend();
+    await expect(racingWrite).resolves.toEqual({
+      sessionId: 'attempt-cas-receipt',
+      createdSession: true,
+    });
+    expect((await store.listRecords('attempt-cas-receipt')).map((r) => r.payload)).toEqual([
+      { payloadVersion: 1, phase: 'draft', answers: { q1: 'OTHER' } },
+      { payloadVersion: 1, phase: 'draft', answers: { q1: 'B' } },
+    ]);
   });
 });

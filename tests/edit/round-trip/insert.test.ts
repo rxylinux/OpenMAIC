@@ -1,5 +1,5 @@
 import JSZip from 'jszip';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { buildPptxBlob } from '@/lib/export/use-export-pptx';
 import { applySlideEditOperation } from '@/lib/edit/slide-ops';
 import {
@@ -64,25 +64,59 @@ describe('round-trip: element.add inserts (PR2 gate)', () => {
   it('(b) inserted default image element (remote URL) — slide XML is non-empty', async () => {
     const { scene, content } = makeSlideFixture();
 
-    const after = applySlideEditOperation(content, {
-      type: 'element.add',
-      element: createDefaultImageElement('rt-img-1', 'https://example.com/x.png'),
+    // Deterministic external boundary: the ONLY network dependency of this
+    // case is the fetch of https://example.com/x.png inside the exporter.
+    // Stub exactly that URL to reject promptly (deterministic failure, no
+    // real request, no timeout dependence). The ORIGINAL fetch is captured
+    // BEFORE the spy so non-target requests delegate to it directly (no
+    // recursion back into the spy), and Request inputs normalize via .url.
+    const REMOTE_IMAGE_URL = 'https://example.com/x.png';
+    const realFetch = globalThis.fetch;
+    let interceptedRemoteFetches = 0;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input instanceof Request
+              ? input.url
+              : '';
+      if (url === REMOTE_IMAGE_URL) {
+        interceptedRemoteFetches += 1;
+        return Promise.reject(new TypeError('fetch: external image boundary refused for test'));
+      }
+      return realFetch(input, init);
     });
 
-    const blob = await exportSlideContent(after, scene);
+    try {
+      const after = applySlideEditOperation(content, {
+        type: 'element.add',
+        element: createDefaultImageElement('rt-img-1', REMOTE_IMAGE_URL),
+      });
 
-    // (b) Tests that element.add on a remote-URL image does NOT crash or corrupt
-    // export. The remote URL cannot be fetched in CI (no network), so the exporter
-    // logs "Failed to convert image to base64, skipping element" and omits the image.
-    // This case gates that export pipeline is resilient; the REAL image round-trip
-    // (data-URL, the PR2 local-upload path) is covered by image-data-url.test.ts
-    // and is deliberately not duplicated here.
+      const blob = await exportSlideContent(after, scene);
 
-    // Basic size guard — a valid PPTX is always several KB at minimum.
-    expect(blob.size).toBeGreaterThan(0);
+      // (b) Tests that element.add on a remote-URL image does NOT crash or corrupt
+      // export. The stubbed remote fetch rejects, so the exporter
+      // logs "Failed to convert image to base64, skipping element" and omits the image.
+      // This case gates that export pipeline is resilient; the REAL image round-trip
+      // (data-URL, the PR2 local-upload path) is covered by image-data-url.test.ts
+      // and is deliberately not duplicated here.
 
-    // The slide XML entry must be present and non-empty.
-    const slideXml = await readPptxEntry(blob, 'ppt/slides/slide1.xml');
-    expect(slideXml.length).toBeGreaterThan(0);
+      // The exact remote boundary was really intercepted (the mock cannot be
+      // silently bypassed by an untouched global fetch).
+      expect(interceptedRemoteFetches).toBe(1);
+      expect(fetchSpy).toHaveBeenCalled();
+
+      // Basic size guard — a valid PPTX is always several KB at minimum.
+      expect(blob.size).toBeGreaterThan(0);
+
+      // The slide XML entry must be present and non-empty.
+      const slideXml = await readPptxEntry(blob, 'ppt/slides/slide1.xml');
+      expect(slideXml.length).toBeGreaterThan(0);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });

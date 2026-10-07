@@ -261,7 +261,7 @@ const strictProbeCases: StrictProbeCase[] = [
       }),
     expectedResult: {
       success: false,
-      message: 'OpenAI Image API error (302): redirect blocked',
+      message: 'OpenAI Image API error (302)',
     },
     assertRequest: () => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -289,7 +289,7 @@ const strictProbeCases: StrictProbeCase[] = [
       }),
     expectedResult: {
       success: false,
-      message: 'Lemonade API error (302): redirect blocked',
+      message: 'Lemonade API error (302)',
     },
     assertRequest: () => {
       expect(fetchMock).toHaveBeenCalledWith('https://lemonade.example.com/v1/models', {
@@ -312,7 +312,10 @@ const strictProbeCases: StrictProbeCase[] = [
         status: 302,
         headers: { Location: PRIVATE_REDIRECT_LOCATION },
       }),
-    expectedResult: { success: false, message: 'API error: redirect blocked' },
+    expectedResult: {
+      success: false,
+      message: 'MiniMax Image API error (HTTP 302)',
+    },
     assertRequest: () => {
       expect(fetchMock).toHaveBeenCalledWith(
         'https://minimax-image.example.com/v1/image_generation',
@@ -347,7 +350,10 @@ const strictProbeCases: StrictProbeCase[] = [
         status: 302,
         headers: { Location: PRIVATE_REDIRECT_LOCATION },
       }),
-    expectedResult: { success: false, message: 'API error: redirect blocked' },
+    expectedResult: {
+      success: false,
+      message: 'MiniMax Video API error (HTTP 302)',
+    },
     assertRequest: () => {
       expect(fetchMock).toHaveBeenCalledWith(
         'https://minimax-video.example.com/v1/video_generation',
@@ -406,9 +412,11 @@ describe('auth-only connectivity probe characterization', () => {
         new Response('server error', { status: 500, statusText: 'Internal Server Error' }),
       );
 
+      // Since D the probe reports a non-auth HTTP failure with fixed text and
+      // never reads the body; a 2xx is the only connected verdict.
       await expect(probe()).resolves.toEqual({
-        success: true,
-        message: `Connected to ${providerName}`,
+        success: false,
+        message: `${providerName} connectivity error: HTTP 500`,
       });
       expect(fetchMock).toHaveBeenCalledTimes(1);
       assertRequest();
@@ -422,7 +430,7 @@ describe('auth-only connectivity probe characterization', () => {
 
       await expect(probe()).resolves.toEqual({
         success: false,
-        message: `${providerName} auth failed (401): invalid key`,
+        message: `${providerName} auth failed (401)`,
       });
       expect(fetchMock).toHaveBeenCalledTimes(1);
     },
@@ -435,7 +443,7 @@ describe('auth-only connectivity probe characterization', () => {
 
       await expect(probe()).resolves.toEqual({
         success: false,
-        message: `${providerName} connectivity error: Error: offline`,
+        message: `${providerName} connectivity error: request failed`,
       });
       expect(fetchMock).toHaveBeenCalledTimes(1);
     },
@@ -449,7 +457,10 @@ describe('auth-only connectivity probe characterization', () => {
 
     expect(result).toEqual({
       success: false,
-      message: 'Kling connectivity error: Error: Kling apiKey must be "accessKey:secretKey" format',
+      // The malformed-key detail is a local configuration error reported
+      // before any request; the generic transport boundary message covers the
+      // rest of the catch path.
+      message: 'Kling connectivity error: request failed',
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -479,7 +490,7 @@ describe('non-matching connectivity probe sentinels', () => {
 
     await expect(
       testMiniMaxImageConnectivity({ providerId: 'minimax-image', apiKey: 'minimax-key' }),
-    ).resolves.toEqual({ success: false, message: 'API error: image unavailable' });
+    ).resolves.toEqual({ success: false, message: 'MiniMax Image API error (HTTP 500)' });
   });
 
   it('keeps MiniMax Video strict for non-2xx responses', async () => {
@@ -492,7 +503,7 @@ describe('non-matching connectivity probe sentinels', () => {
 
     await expect(
       testMiniMaxVideoConnectivity({ providerId: 'minimax-video', apiKey: 'minimax-key' }),
-    ).resolves.toEqual({ success: false, message: 'API error: video unavailable' });
+    ).resolves.toEqual({ success: false, message: 'MiniMax Video API error (HTTP 500)' });
   });
 
   const googleCases = [
@@ -508,7 +519,7 @@ describe('non-matching connectivity probe sentinels', () => {
       successMessage: 'Connected to Veo (veo-test)',
       failureMessage:
         'Invalid API key or unauthorized (400). Check your API Key and Base URL match the same provider.',
-      redirectFailureMessage: 'Veo connectivity failed (302): redirect blocked',
+      redirectFailureMessage: 'Veo connectivity failed (302)',
     },
     {
       name: 'Nano Banana',
@@ -522,7 +533,7 @@ describe('non-matching connectivity probe sentinels', () => {
       successMessage: 'Connected to Nano Banana (nano-test)',
       failureMessage:
         'Invalid API key or unauthorized (400). Check your API Key and Base URL match the same provider.',
-      redirectFailureMessage: 'Nano Banana connectivity failed (302): redirect blocked',
+      redirectFailureMessage: 'Nano Banana connectivity failed (302)',
     },
   ];
 

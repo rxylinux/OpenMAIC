@@ -2478,37 +2478,23 @@ export function getModel(config: ModelConfig): ModelWithInfo {
         apiKey: effectiveApiKey,
         baseURL: effectiveBaseUrl,
       };
-      if (config.proxy) {
-        const proxy = config.proxy;
-        let agent: unknown;
-        googleOptions.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-          const { ProxyAgent, fetch: undiciFetch } = (await import(
-            /* webpackIgnore: true */ 'undici'
-          )) as {
-            ProxyAgent: new (options: { uri: string } & Record<string, unknown>) => unknown;
-            fetch: (
-              input: string | URL | Request,
-              init?: Record<string, unknown>,
-            ) => Promise<unknown>;
-          };
-          // Same budget as the direct dispatcher: proxied or not, this is an
-          // LLM request whose headers may only arrive after minutes of thinking.
-          // (http/https proxies only — undici's Socks5ProxyAgent drops these
-          // options, so socks5:// proxies keep undici's default 300 s cap.)
-          agent ??= new ProxyAgent({
-            uri: proxy,
-            headersTimeout: LLM_FETCH_TIMEOUT_MS,
-            bodyTimeout: LLM_FETCH_TIMEOUT_MS,
-          });
-          const response = await undiciFetch(input, {
-            ...(init as Record<string, unknown>),
-            dispatcher: agent,
-          });
-          return response as Response;
-        }) as typeof fetch;
-      } else {
-        googleOptions.fetch = transportFetch;
+      // A configured proxy must never silently disengage (an operator's proxy
+      // would be bypassed without anyone noticing). `resolveModel` installs a
+      // proxy-aware `fetchImpl` (lib/server/llm-provider-fetch.ts) whenever it
+      // passes `proxy`; a direct `getModel` caller that sets `proxy` without
+      // supplying that transport is a wiring error and fails loud instead of
+      // leaking traffic around the proxy.
+      if (config.proxy && !config.fetchImpl) {
+        throw new Error(
+          'getModel received a proxy without a proxy-aware fetchImpl; route through resolveModel so the proxy transport is installed.',
+        );
       }
+      // Proxied or not, the outbound transport is the caller's `fetchImpl`:
+      // when the operator configured a proxy, resolveModel installs a proxy
+      // transport that carries the ProxyAgent, the 15-minute budget and
+      // per-hop redirect validation; a caller-chosen endpoint is refused
+      // there before this branch is reached.
+      googleOptions.fetch = transportFetch;
       const google = createGoogleGenerativeAI(googleOptions);
       model = google.chat(config.modelId);
       break;

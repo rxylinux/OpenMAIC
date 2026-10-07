@@ -7,6 +7,7 @@
 
 import { NextRequest } from 'next/server';
 import { callLLM } from '@/lib/ai/llm';
+import { parseAiGradeScore } from '@/lib/quiz/grading';
 import { createLogger } from '@/lib/logger';
 import { apiError, apiSuccess } from '@/lib/server/api-response';
 import { resolveModelFromRequest } from '@/lib/server/resolve-model';
@@ -18,11 +19,6 @@ interface GradeRequest {
   points: number;
   commentPrompt?: string;
   language?: string;
-}
-
-interface GradeResponse {
-  score: number;
-  comment: string;
 }
 
 export async function POST(req: NextRequest) {
@@ -79,30 +75,37 @@ ${commentPrompt ? `Grading guidance: ${commentPrompt}\n` : ''}Student answer: ${
       thinkingConfig,
     );
 
-    // Parse the LLM response as JSON
+    // Parse the LLM response as JSON — STRICTLY. The raw score must be a
+    // finite number before anything else touches it: null, "0"-as-string,
+    // NaN, Infinity or a non-JSON body are "no verdict", never a forged
+    // half-score (the old fallback) and never Number()-coerced into a valid
+    // zero. A real numeric 0 is a legitimate wrong-verdict and passes.
     const text = result.text.trim();
-    let gradeResult: GradeResponse;
-
-    try {
-      // Try to extract JSON from the response
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error('No JSON found');
-      const parsed = JSON.parse(jsonMatch[0]);
-      gradeResult = {
-        score: Math.max(0, Math.min(points, Math.round(Number(parsed.score)))),
-        comment: String(parsed.comment || ''),
-      };
-    } catch {
-      // Fallback: give partial credit with a generic comment
-      gradeResult = {
-        score: Math.round(points * 0.5),
-        comment: isZh
-          ? '已作答，请参考标准答案。'
-          : 'Answer received. Please refer to the standard answer.',
-      };
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    let parsed: unknown = null;
+    if (jsonMatch) {
+      try {
+        parsed = JSON.parse(jsonMatch[0]);
+      } catch {
+        parsed = null; // malformed JSON in the braces: no verdict either
+      }
+    }
+    const verdict = parseAiGradeScore(parsed, points);
+    if (!verdict) {
+      // Upstream produced nothing verifiable. Fail loud, not lenient: the
+      // client keeps the answer and shows an honest "ungraded, retryable"
+      // state instead of recording a fabricated mistake.
+      log.warn(
+        `Quiz grading produced no verifiable verdict [question="${questionSnippet ?? 'unknown'}...", raw=${JSON.stringify(text.slice(0, 120))}]`,
+      );
+      return apiError(
+        'AI_GRADE_UNAVAILABLE',
+        502,
+        isZh ? '评分未完成，请重试' : 'Grading unavailable; retry',
+      );
     }
 
-    return apiSuccess({ ...gradeResult });
+    return apiSuccess({ score: Math.round(verdict.earned), comment: verdict.comment ?? '' });
   } catch (error) {
     log.error(
       `Quiz grading failed [question="${questionSnippet ?? 'unknown'}...", points=${resolvedPoints ?? 'unknown'}]:`,

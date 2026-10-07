@@ -14,6 +14,7 @@ export const PROMPT_IDS = {
   REQUIREMENTS_TO_OUTLINES: 'requirements-to-outlines',
   SLIDE_CONTENT: 'slide-content',
   QUIZ_CONTENT: 'quiz-content',
+  SIMILAR_QUESTION: 'similar-question',
   SIMULATION_CONTENT: 'simulation-content',
   DIAGRAM_CONTENT: 'diagram-content',
   CODE_CONTENT: 'code-content',

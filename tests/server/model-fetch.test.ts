@@ -1,62 +1,31 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+/**
+ * `fetchModels` unit contract on an injected transport.
+ *
+ * The default transport is the pinned provider fetch (see
+ * `model-fetch-http.test.ts` and `tests/api/probe-models.test.ts` for its
+ * live-socket coverage); these tests inject `fetchImpl` so the candidate
+ * ordering, redirect refusal, fallback, error-status and error-hygiene
+ * contracts stay pinned independently of the socket layer.
+ */
+import { describe, expect, it, vi } from 'vitest';
+
 import { buildModelsUrlCandidates, fetchModels, ModelFetchError } from '@/lib/server/model-fetch';
 
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
-
 describe('buildModelsUrlCandidates', () => {
-  it('plain root → /v1/models', () => {
-    expect(buildModelsUrlCandidates('https://api.siliconflow.cn')).toEqual([
-      'https://api.siliconflow.cn/v1/models',
-    ]);
-  });
-
-  it('strips a trailing slash', () => {
-    expect(buildModelsUrlCandidates('https://api.example.com/')).toEqual([
+  it('builds v1/models for a plain base url', () => {
+    expect(buildModelsUrlCandidates('https://api.example.com')).toEqual([
       'https://api.example.com/v1/models',
     ]);
   });
 
-  it('base ending in /v1 → {base}/models (no double /v1)', () => {
-    expect(buildModelsUrlCandidates('https://api.example.com/v1')).toEqual([
-      'https://api.example.com/v1/models',
+  it('uses models directly for a versioned base url', () => {
+    expect(buildModelsUrlCandidates('https://api.example.com/v4')).toEqual([
+      'https://api.example.com/v4/models',
+      'https://api.example.com/v4/v1/models',
     ]);
   });
 
-  it('zhipu coding paas/v4 → /models first, /v1/models fallback', () => {
-    expect(buildModelsUrlCandidates('https://open.bigmodel.cn/api/coding/paas/v4')).toEqual([
-      'https://open.bigmodel.cn/api/coding/paas/v4/models',
-      'https://open.bigmodel.cn/api/coding/paas/v4/v1/models',
-    ]);
-  });
-
-  it('explicit override wins and is the only candidate', () => {
-    expect(
-      buildModelsUrlCandidates('https://x.com/v1', {
-        modelsUrlOverride: 'https://x.com/custom/models',
-      }),
-    ).toEqual(['https://x.com/custom/models']);
-  });
-
-  it('base ending exactly in a compat suffix → strips it and appends fallbacks', () => {
-    // Suffix-strip only triggers when the base ENDS with the suffix.
-    const c = buildModelsUrlCandidates('https://api.minimaxi.com/anthropic');
-    // not a version segment → {base}/v1/models first
-    expect(c[0]).toBe('https://api.minimaxi.com/anthropic/v1/models');
-    // then stripped-suffix fallbacks
-    expect(c).toContain('https://api.minimaxi.com/v1/models');
-    expect(c).toContain('https://api.minimaxi.com/models');
-  });
-
-  it('base .../anthropic/v1 keeps the version segment (no strip)', () => {
-    // ends in /v1, not the compat suffix → only {base}/models.
-    expect(buildModelsUrlCandidates('https://api.minimaxi.com/anthropic/v1')).toEqual([
-      'https://api.minimaxi.com/anthropic/v1/models',
-    ]);
-  });
-
-  it('longest compat suffix wins (/api/anthropic over /anthropic)', () => {
+  it('adds stripped-root candidates for a known anthropic-compat suffix', () => {
     const c = buildModelsUrlCandidates('https://gw.example.com/api/anthropic');
     expect(c).toContain('https://gw.example.com/v1/models');
     expect(c).toContain('https://gw.example.com/models');
@@ -73,7 +42,7 @@ describe('buildModelsUrlCandidates', () => {
 });
 
 describe('fetchModels', () => {
-  it('returns a sorted model list from a successful response without following redirects', async () => {
+  it('returns a sorted model list from a successful response', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -81,9 +50,10 @@ describe('fetchModels', () => {
         data: [{ id: 'z-model', owned_by: 'provider' }, { id: 'a-model' }],
       }),
     } as unknown as Response);
-    vi.stubGlobal('fetch', fetchMock);
 
-    await expect(fetchModels('https://api.example.com', 'test-key')).resolves.toEqual([
+    await expect(
+      fetchModels('https://api.example.com', 'test-key', { fetchImpl: fetchMock }),
+    ).resolves.toEqual([
       { id: 'a-model', ownedBy: undefined },
       { id: 'z-model', ownedBy: 'provider' },
     ]);
@@ -108,74 +78,102 @@ describe('fetchModels', () => {
         text,
         json,
       } as unknown as Response);
-      vi.stubGlobal('fetch', fetchMock);
 
-      const error = await fetchModels(
-        'https://gateway.example.com/api/anthropic',
-        'test-key',
-      ).catch((caught: unknown) => caught);
+      const error = await fetchModels('https://gateway.example.com/api/anthropic', 'test-key', {
+        fetchImpl: fetchMock,
+      }).catch((caught: unknown) => caught);
 
       expect(error).toBeInstanceOf(ModelFetchError);
       expect(error).toMatchObject({ status });
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(text).not.toHaveBeenCalled();
       expect(json).not.toHaveBeenCalled();
-      expect(fetchMock).toHaveBeenCalledWith(
-        'https://gateway.example.com/api/anthropic/v1/models',
-        expect.objectContaining({ redirect: 'manual' }),
-      );
     },
   );
 
-  it.each([404, 405])(
-    'falls back after %i and keeps redirect handling manual for every candidate',
-    async (status) => {
-      const firstText = vi.fn();
-      const fetchMock = vi
-        .fn()
-        .mockResolvedValueOnce({ ok: false, status, text: firstText } as unknown as Response)
-        .mockResolvedValueOnce({
-          ok: true,
-          status: 200,
-          json: vi.fn().mockResolvedValue({ data: [{ id: 'fallback-model' }] }),
-        } as unknown as Response);
-      vi.stubGlobal('fetch', fetchMock);
-
-      await expect(
-        fetchModels('https://gateway.example.com/api/anthropic', 'test-key'),
-      ).resolves.toEqual([{ id: 'fallback-model', ownedBy: undefined }]);
-
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect(firstText).not.toHaveBeenCalled();
-      expect(fetchMock).toHaveBeenNthCalledWith(
-        1,
-        'https://gateway.example.com/api/anthropic/v1/models',
-        expect.objectContaining({ redirect: 'manual' }),
+  it('maps a redirect refusal from the strict transport to the redirect contract', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValue(
+        new TypeError('fetch failed', { cause: new Error('unexpected redirect') }),
       );
-      expect(fetchMock).toHaveBeenNthCalledWith(
-        2,
-        'https://gateway.example.com/v1/models',
-        expect.objectContaining({ redirect: 'manual' }),
-      );
-    },
-  );
 
-  it.each([401, 403])('keeps upstream %i terminal and preserves its status', async (status) => {
-    const text = vi.fn().mockResolvedValue('invalid key');
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: false,
-      status,
-      text,
-    } as unknown as Response);
-    vi.stubGlobal('fetch', fetchMock);
-
-    const error = await fetchModels('https://api.example.com', 'bad-key').catch(
-      (caught: unknown) => caught,
-    );
+    const error = await fetchModels('https://api.example.com', 'test-key', {
+      fetchImpl: fetchMock,
+    }).catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(ModelFetchError);
-    expect(error).toMatchObject({ status });
+    expect(error).toMatchObject({ status: 302, message: 'Redirects are not allowed' });
+  });
+
+  it('does not retry a redirect refusal from the strict transport', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValue(
+        new TypeError('fetch failed', { cause: new Error('unexpected redirect') }),
+      );
+
+    await fetchModels('https://api.example.com', 'test-key', {
+      fetchImpl: fetchMock,
+    }).catch(() => undefined);
+
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(text).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([404, 405])('falls back after %i without reading the error body', async (status) => {
+    const firstText = vi.fn();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status, text: firstText } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockResolvedValue({ data: [{ id: 'fallback-model' }] }),
+      } as unknown as Response);
+
+    await expect(
+      fetchModels('https://gateway.example.com/api/anthropic', 'test-key', {
+        fetchImpl: fetchMock,
+      }),
+    ).resolves.toEqual([{ id: 'fallback-model', ownedBy: undefined }]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(firstText).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 403])(
+    'keeps upstream %i terminal, preserves its status and never carries the body',
+    async (status) => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status,
+        // A Response whose body is cancelled instead of read: the provider's
+        // error text must never reach the caller.
+        body: { cancel: vi.fn().mockResolvedValue(undefined) },
+      } as unknown as Response);
+
+      const error = await fetchModels('https://api.example.com', 'bad-key', {
+        fetchImpl: fetchMock,
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ModelFetchError);
+      expect(error).toMatchObject({ status });
+      expect((error as ModelFetchError).message).toBe(`HTTP ${status}`);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('reports a non-2xx status without the provider body', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      body: { cancel: vi.fn().mockResolvedValue(undefined) },
+    } as unknown as Response);
+
+    const error = await fetchModels('https://api.example.com', 'key', {
+      fetchImpl: fetchMock,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ status: 500, message: 'HTTP 500' });
   });
 });

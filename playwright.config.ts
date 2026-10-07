@@ -27,7 +27,12 @@ export default defineConfig({
     // run the dev server.
     command: process.env.CI ? 'pnpm start' : 'pnpm dev',
     url: 'http://localhost:3002',
-    reuseExistingServer: !process.env.CI,
+    // E2E_ISOLATED_DATABASE_URL pins the dev server to a disposable,
+    // synthetic PostgreSQL instance: the app's background agents get a real
+    // (isolated) database instead of spamming ENOTFOUND against an inherited
+    // hostname, and no user data is ever reachable. It also forces a FRESH
+    // server so the env actually applies.
+    reuseExistingServer: !process.env.CI && !process.env.E2E_ISOLATED_DATABASE_URL,
     timeout: 120_000,
     // Enable the MAIC Editor (Pro mode) so editor e2e can reach it. This is a
     // build-time NEXT_PUBLIC_* flag: in CI it must be set on the dedicated
@@ -37,6 +42,9 @@ export default defineConfig({
       NEXT_PUBLIC_MAIC_EDITOR_ENABLED: 'true',
       NEXT_PUBLIC_PI_CHAT_ENABLED: 'true',
       NEXT_PUBLIC_COURSEWARE_REFERENCE_ENABLED: 'true',
+      ...(process.env.E2E_ISOLATED_DATABASE_URL
+        ? { DATABASE_URL: process.env.E2E_ISOLATED_DATABASE_URL }
+        : {}),
     },
   },
 });

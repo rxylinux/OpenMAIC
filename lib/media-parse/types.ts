@@ -32,6 +32,12 @@ export interface MediaParserConfig {
    * Off by default; enable only in a trusted server/dev/test context.
    */
   allowEnvFallback?: boolean;
+  /**
+   * Whether the provider is server-managed (operator configuration). Server
+   * callers set it; a managed base URL may reach a local network without the
+   * ALLOW_LOCAL_NETWORKS opt-in under the strict parser transports.
+   */
+  managed?: boolean;
 }
 
 export interface MediaParseInput {

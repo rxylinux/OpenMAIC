@@ -23,6 +23,16 @@ services:
         - NEXT_PUBLIC_PRO_WORKBENCH_ENABLED=${NEXT_PUBLIC_PRO_WORKBENCH_ENABLED:-}
     ports:
       - '3000:3000'
+    # 宿主机代理的 fake-IP DNS 会把域名解析成 198.18.x.x 保留网段，
+    # 被 SSRF 防护无条件拒绝（ALLOW_LOCAL_NETWORKS 也管不到），导致
+    # LLM 请求全部失败。dns: 改公共 DNS 无效（代理劫持所有 53 端口查询），
+    # 只能用 extra_hosts 把关键域名钉在真实公网 IP 上。
+    # ⚠️ IP 来自阿里云 DNS（DoH 查询），若将来 LLM/解析突然失败，
+    #    优先怀疑这里钉的 IP 过期，重新解析后替换：
+    #    curl -s "https://223.5.5.5/resolve?name=open.bigmodel.cn&type=A"
+    extra_hosts:
+      - 'open.bigmodel.cn:8.133.182.104'
+      - 'mineru.net:47.117.160.189'
     env_file:
       - .env.local
     environment:

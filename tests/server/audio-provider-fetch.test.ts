@@ -154,16 +154,31 @@ describe('audioProviderFetch — redirect + rebinding hardening', () => {
       res.end();
     });
 
+    // The loopback origin needs the operator opt-in; the metadata hop is
+    // refused under every policy, including this one.
     await expect(
       audioProviderFetch(`http://127.0.0.1:${origin.port}/start`, undefined, {
-        allowLocalNetworks: false,
+        allowLocalNetworks: true,
       }),
     ).rejects.toThrow(METADATA_BLOCK_MESSAGE);
 
     expect(origin.requests()).toBe(1);
   });
 
-  it('refuses a 302 to a loopback address under the strict public policy', async () => {
+  it('refuses a loopback IP-literal origin under the strict public policy before connecting', async () => {
+    const origin = await startLoopback();
+
+    await expect(
+      audioProviderFetch(`http://127.0.0.1:${origin.port}/start`, undefined, {
+        allowLocalNetworks: false,
+      }),
+    ).rejects.toThrow(PRIVATE_BLOCK_MESSAGE);
+
+    // The policy refusal happens before any socket is opened.
+    expect(origin.requests()).toBe(0);
+  });
+
+  it('refuses a 302 to a loopback address when the origin allows local networks but hops stay strict', async () => {
     const internal = await startLoopback();
     const origin = await startLoopback((_req, res) => {
       res.writeHead(302, { Location: `http://127.0.0.1:${internal.port}/secret` });
@@ -172,7 +187,8 @@ describe('audioProviderFetch — redirect + rebinding hardening', () => {
 
     await expect(
       audioProviderFetch(`http://127.0.0.1:${origin.port}/start`, undefined, {
-        allowLocalNetworks: false,
+        allowLocalNetworks: true,
+        redirectAllowLocalNetworks: false,
       }),
     ).rejects.toThrow(PRIVATE_BLOCK_MESSAGE);
 

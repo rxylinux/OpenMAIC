@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fetchModels, ModelFetchError } from '@/lib/server/model-fetch';
+import { fetchModels, ModelFetchError, type ModelFetchTransport } from '@/lib/server/model-fetch';
 
 function stalled(signal: AbortSignal): Promise<never> {
   return new Promise((_, reject) => {
@@ -12,9 +12,11 @@ function successful() {
   return { ok: true, status: 200, json: async () => ({ data: [{ id: 'model' }] }) };
 }
 
+let transport: ModelFetchTransport | undefined;
+
 afterEach(() => {
   vi.useRealTimers();
-  vi.unstubAllGlobals();
+  transport = undefined;
 });
 
 describe('model discovery deadlines and retries', () => {
@@ -29,8 +31,10 @@ describe('model discovery deadlines and retries', () => {
         if (phase === 'headers') return stalled(signal);
         return Promise.resolve({ ok: true, status: 200, json: () => stalled(signal) });
       });
-      vi.stubGlobal('fetch', fetchMock);
-      const result = fetchModels('https://example.com', '').catch((error) => error);
+      transport = fetchMock as unknown as ModelFetchTransport;
+      const result = fetchModels('https://example.com', '', { fetchImpl: transport }).catch(
+        (error) => error,
+      );
       await vi.advanceTimersByTimeAsync(14_999);
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(signals[0].aborted).toBe(false);
@@ -53,8 +57,8 @@ describe('model discovery deadlines and retries', () => {
       await new Promise((resolve) => setTimeout(resolve, 10_000));
       return { ok: true, status: 200, json: () => stalled(init.signal) };
     });
-    vi.stubGlobal('fetch', fetchMock);
-    const result = fetchModels('https://example.com', '');
+    transport = fetchMock as unknown as ModelFetchTransport;
+    const result = fetchModels('https://example.com', '', { fetchImpl: transport });
     await vi.advanceTimersByTimeAsync(15_000);
     expect(await result).toEqual([{ id: 'model', ownedBy: undefined }]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -70,8 +74,8 @@ describe('model discovery deadlines and retries', () => {
       json: () =>
         new Promise((resolve) => setTimeout(() => resolve({ data: [{ id: 'slow' }] }), 14_999)),
     }));
-    vi.stubGlobal('fetch', fetchMock);
-    const result = fetchModels('https://example.com', '');
+    transport = fetchMock as unknown as ModelFetchTransport;
+    const result = fetchModels('https://example.com', '', { fetchImpl: transport });
     await vi.advanceTimersByTimeAsync(14_999);
     expect(await result).toEqual([{ id: 'slow', ownedBy: undefined }]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -87,8 +91,10 @@ describe('model discovery deadlines and retries', () => {
         status,
         text: () => stalled(init.signal),
       }));
-      vi.stubGlobal('fetch', fetchMock);
-      const result = fetchModels('https://example.com', '').catch((error) => error);
+      transport = fetchMock as unknown as ModelFetchTransport;
+      const result = fetchModels('https://example.com', '', { fetchImpl: transport }).catch(
+        (error) => error,
+      );
       await vi.advanceTimersByTimeAsync(15_000);
       expect(await result).toBeInstanceOf(ModelFetchError);
       expect(await result).toMatchObject({ status });
@@ -102,8 +108,8 @@ describe('model discovery deadlines and retries', () => {
       .fn()
       .mockRejectedValueOnce(new TypeError('fetch failed'))
       .mockResolvedValueOnce(successful());
-    vi.stubGlobal('fetch', fetchMock);
-    expect(await fetchModels('https://example.com', '')).toHaveLength(1);
+    transport = fetchMock as unknown as ModelFetchTransport;
+    expect(await fetchModels('https://example.com', '', { fetchImpl: transport })).toHaveLength(1);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -115,8 +121,10 @@ describe('model discovery deadlines and retries', () => {
         throw new SyntaxError('bad JSON');
       },
     }));
-    vi.stubGlobal('fetch', fetchMock);
-    await expect(fetchModels('https://example.com', '')).rejects.toBeInstanceOf(SyntaxError);
+    transport = fetchMock as unknown as ModelFetchTransport;
+    await expect(
+      fetchModels('https://example.com', '', { fetchImpl: transport }),
+    ).rejects.toBeInstanceOf(SyntaxError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -129,8 +137,10 @@ describe('model discovery deadlines and retries', () => {
       }
       return { ok: true, status: 200, json: () => stalled(init.signal) };
     });
-    vi.stubGlobal('fetch', fetchMock);
-    const result = fetchModels('https://example.com/anthropic', '').catch((error) => error);
+    transport = fetchMock as unknown as ModelFetchTransport;
+    const result = fetchModels('https://example.com/anthropic', '', { fetchImpl: transport }).catch(
+      (error) => error,
+    );
     await vi.advanceTimersByTimeAsync(30_000);
     expect(await result).toMatchObject({ name: 'TimeoutError' });
     expect(fetchMock).toHaveBeenCalledTimes(3);

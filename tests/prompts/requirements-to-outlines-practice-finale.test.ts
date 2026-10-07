@@ -7,6 +7,7 @@ function outlinePromptText() {
     pdfContent: 'None',
     availableImages: 'No images available',
     userProfile: '',
+    difficultyPreference: '',
     researchContext: 'None',
     teacherContext: '',
     hasSourceImages: false,

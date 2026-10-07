@@ -297,6 +297,9 @@ function pdfExtractionCandidates(): Array<{
           apiKey: resolvePDFApiKey(id) || undefined,
           baseUrl: resolvePDFBaseUrl(id),
           allowEnvFallback: true,
+          // Server-resolved configuration: a configured endpoint is operator
+          // configuration for the strict parser transports.
+          managed: true,
           // fetch_url persists and returns text only. Avoid materializing
           // attacker-controlled PDF rasters in the application process.
           textOnly: true,

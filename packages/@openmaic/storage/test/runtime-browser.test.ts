@@ -334,3 +334,121 @@ describe('BrowserRuntimeStore mergeLearner guards', () => {
     ]);
   });
 });
+
+// --- anchored lineage guard: reader-equivalent relevance (final review) -----
+// The guard's `relevantSceneId` predicate must decide EXACTLY what the
+// canonical quiz reader adopts: the sibling's LATEST scene-filtered record,
+// validated as a quiz payload — never "any anchored record", and never a
+// sibling whose envelope the reader's own listSessions would omit.
+
+describe('BrowserRuntimeStore anchored guard reader-equivalence', () => {
+  /** A quiz-kind harness: root target + optional newer sibling factory. */
+  function quizHarness(dbName: string) {
+    const idb = new IDBFactory();
+    const store = new BrowserRuntimeStore({ indexedDB: idb, dbName });
+    return { idb, store };
+  }
+
+  async function seedRoot(store: BrowserRuntimeStore) {
+    await store.createSession(
+      makeSession({
+        id: 'quiz-root',
+        kind: 'quizAttempt',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      }),
+    );
+    await store.appendRecord(
+      makeRecordInit('quiz-root', {
+        sceneId: 'scene-quiz',
+        payload: { payloadVersion: 1, phase: 'draft', answers: {} },
+      }),
+    );
+  }
+
+  async function seedNewerSibling(store: BrowserRuntimeStore, id: string) {
+    await store.createSession(
+      makeSession({
+        id,
+        kind: 'quizAttempt',
+        createdAt: '2026-01-02T00:00:00.000Z',
+        updatedAt: '2026-01-02T00:00:00.000Z',
+      }),
+    );
+  }
+
+  test('a valid LATEST relevant record blocks (the reader would adopt it)', async () => {
+    const { store } = quizHarness('maic-runtime-guard-valid-latest');
+    await seedRoot(store);
+    await seedNewerSibling(store, 'sibling-valid');
+    await store.appendRecord(
+      makeRecordInit('sibling-valid', {
+        sceneId: 'scene-quiz',
+        payload: { payloadVersion: 1, phase: 'draft', answers: { q1: 'A' } },
+      }),
+    );
+
+    await expect(
+      store.setSessionStatusIfLatest!('quiz-root', 'active', '2026-01-03T00:00:00.000Z', {
+        relevantSceneId: 'scene-quiz',
+      }),
+    ).resolves.toBe(false);
+  });
+
+  test('a MALFORMED latest tail (over a valid older draft) never blocks — the reader skips that sibling', async () => {
+    const { store } = quizHarness('maic-runtime-guard-malformed-tail');
+    await seedRoot(store);
+    await seedNewerSibling(store, 'sibling-malformed-tail');
+    // seq 0: a valid draft the reader would adopt…
+    await store.appendRecord(
+      makeRecordInit('sibling-malformed-tail', {
+        sceneId: 'scene-quiz',
+        payload: { payloadVersion: 1, phase: 'draft', answers: { q1: 'A' } },
+      }),
+    );
+    // …then seq 1: a tail the reader's payload check REJECTS (no
+    // payloadVersion) — passes the skeleton write gate, never adopted.
+    await store.appendRecord(
+      makeRecordInit('sibling-malformed-tail', {
+        sceneId: 'scene-quiz',
+        payload: { phase: 'draft', answers: { q1: 'A' } },
+      }),
+    );
+
+    await expect(
+      store.setSessionStatusIfLatest!('quiz-root', 'active', '2026-01-03T00:00:00.000Z', {
+        relevantSceneId: 'scene-quiz',
+      }),
+    ).resolves.toBe(true);
+  });
+
+  test('an anchored record of a sibling whose envelope listSessions omits never blocks', async () => {
+    const { idb, store } = quizHarness('maic-runtime-guard-corrupt-envelope');
+    await seedRoot(store);
+    await seedNewerSibling(store, 'sibling-corrupt-envelope');
+    await store.appendRecord(
+      makeRecordInit('sibling-corrupt-envelope', {
+        sceneId: 'scene-quiz',
+        payload: { payloadVersion: 1, phase: 'draft', answers: { q1: 'A' } },
+      }),
+    );
+    // Corrupt the sibling's envelope in place: strip its version stamp — a
+    // row no producer can write, omitted by listings, loud on direct reads.
+    await reStampSession(
+      idb,
+      'maic-runtime-guard-corrupt-envelope',
+      'sibling-corrupt-envelope',
+      undefined,
+    );
+
+    await expect(
+      store.setSessionStatusIfLatest!('quiz-root', 'active', '2026-01-03T00:00:00.000Z', {
+        relevantSceneId: 'scene-quiz',
+      }),
+    ).resolves.toBe(true);
+    // The same corrupt sibling still blocks the GENERIC conservative form.
+    await expect(
+      store.setSessionStatusIfLatest!('quiz-root', 'active', '2026-01-03T00:00:01.000Z'),
+    ).resolves.toBe(false);
+  });
+});

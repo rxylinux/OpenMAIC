@@ -6,6 +6,8 @@ import type {
 } from '@openmaic/dsl';
 import { RuntimeAppendConflictError, type RuntimeStore } from '@openmaic/storage';
 import type { QuestionResult } from '@/lib/quiz/grading';
+import type { MistakeCapturePayload } from '@/lib/mistake-book/client';
+import { questionEventId } from '@/lib/mistake-book/client';
 import {
   clearDraftRecovery,
   clearLegacyQuizStateSnapshot,
@@ -15,11 +17,60 @@ import {
 import { getLearnerKey } from '@/lib/runtime/learner-key';
 import { getRuntimeStore } from '@/lib/runtime/store';
 
+/**
+ * One frozen per-question capture plan entry (Codex intent-design v1):
+ * everything needed to execute/recover THIS question's capture on its
+ * ORIGINAL identity — never rebuilt, never re-owned. `originOwner` is the
+ * owner fact at plan-build time ('' = explicitly unknown → claim-only).
+ */
+export interface QuizCapturePlanItem {
+  questionId: string;
+  eventId: string;
+  /** The COMPLETE frozen per-question capture payload. */
+  payload: MistakeCapturePayload;
+  /** Creation identity minted ONCE at plan build; never re-minted. */
+  recordToken: string;
+}
+
+/**
+ * The attempt-scoped capture plan (design §1): a HEADER frozen on the
+ * attempt's FIRST new-pipeline review (even with zero wrong items) plus
+ * per-question items merged only as NEW decided-wrong results arrive. The
+ * header's originOwner governs every later item of the SAME attempt — a
+ * cookie/cache switch to B can never claim the old attempt's new wrongs.
+ */
+export interface QuizCapturePlan {
+  planVersion: 1;
+  /** Owner fact at first plan build ('' = explicitly unknown → claim-only). */
+  originOwner: string;
+  /** The episode (attempt) the plan was born in — never changes on merge. */
+  originEpisodeId: string;
+  attemptId: string;
+  sceneId: string;
+  learnerKey: string;
+  /**
+   * Historical-exemption baseline (P3 §4): question ids that were ALREADY
+   * decided wrong in this attempt's real no-plan (legacy) reviews — frozen
+   * when the first modern plan upgrades the attempt and carried immutably
+   * on every merge. They never enter `items` (their historical zero-re-
+   * capture fact stays durable through modern reloads and further
+   * regrading); a genuinely NEW attempt builds a fresh header without them.
+   */
+  legacyExemptQuestions?: string[];
+  items: QuizCapturePlanItem[];
+}
+
 export interface QuizAttemptPayload extends QuizAttemptSkeleton {
   payloadVersion: 1;
   phase: QuizAttemptPhase;
   answers: QuizAnswers;
   results?: QuestionResult[];
+  /**
+   * Frozen capture plan persisted WITH this review (Codex intent-design):
+   * present ONLY on reviews written by the new pipeline — legacy reviews
+   * carry no plan and keep their historical zero-re-capture semantics.
+   */
+  capturePlan?: QuizCapturePlan;
 }
 
 export interface QuizAttemptRecordInput {
@@ -29,6 +80,8 @@ export interface QuizAttemptRecordInput {
   phase: QuizAttemptPhase;
   answers: QuizAnswers;
   results?: QuestionResult[];
+  /** Forwarded verbatim to the stored payload (Codex intent-design §1). */
+  capturePlan?: QuizCapturePlan;
   /** Begin a distinct retry even when the prior attempt has the same payload. */
   startNewAttempt?: boolean;
 }
@@ -62,6 +115,8 @@ export interface QuizAttemptState {
   phase: QuizAttemptPhase;
   answers: QuizAnswers;
   results?: QuestionResult[];
+  /** See QuizAttemptPayload.capturePlan (absent on legacy reviews). */
+  capturePlan?: QuizCapturePlan;
 }
 
 export interface LoadedQuizAttemptState {
@@ -79,14 +134,14 @@ export type QuizDraftInput = Omit<QuizAttemptRecordInput, 'phase' | 'results'>;
 
 export interface QuizAttemptWriter {
   scheduleDraft(input: QuizDraftInput): void;
-  flushDraft(): Promise<void>;
-  recordPhase(input: QuizAttemptRecordInput): Promise<void>;
+  flushDraft(): Promise<QuizAttemptWriteOutcome | void>;
+  recordPhase(input: QuizAttemptRecordInput): Promise<QuizAttemptWriteOutcome>;
   cancelDraft(): void;
 }
 
 export interface QuizAttemptWriterOptions {
   debounceMs?: number;
-  write?: (input: QuizAttemptRecordInput) => Promise<void>;
+  write?: (input: QuizAttemptRecordInput) => Promise<QuizAttemptWriteOutcome>;
   onError?: (error: unknown) => void;
 }
 
@@ -135,8 +190,9 @@ export function createQuizAttemptWriter(options: QuizAttemptWriterOptions = {}):
   const write =
     options.write ??
     (async (input) => {
-      await recordQuizAttempt(input);
+      const outcome = await recordQuizAttempt(input);
       clearDraftRecovery(input.sceneId, input.attemptId, input.answers);
+      return outcome;
     });
   const onError = options.onError ?? (() => {});
   let pendingDraft: QuizDraftInput | undefined;
@@ -148,10 +204,13 @@ export function createQuizAttemptWriter(options: QuizAttemptWriterOptions = {}):
     timer = undefined;
   };
 
-  const run = (input: QuizAttemptRecordInput): Promise<void> => {
+  const run = (input: QuizAttemptRecordInput): Promise<QuizAttemptWriteOutcome> => {
     const operation = tail.then(() => write(input));
     void operation.catch(onError);
-    const settled = operation.catch(() => {});
+    const settled: Promise<void> = operation.then(
+      () => undefined,
+      () => undefined,
+    );
     tail = settled;
     let attemptTails = writerTails.get(input.attemptId);
     if (!attemptTails) {
@@ -168,7 +227,7 @@ export function createQuizAttemptWriter(options: QuizAttemptWriterOptions = {}):
     return operation;
   };
 
-  const flushDraft = (): Promise<void> => {
+  const flushDraft = (): Promise<QuizAttemptWriteOutcome | void> => {
     clearTimer();
     if (!pendingDraft) return tail;
     const input = pendingDraft;
@@ -245,6 +304,128 @@ function asQuizPayload(record: RuntimeRecord | undefined): QuizAttemptPayload | 
   return payload as QuizAttemptPayload;
 }
 
+/**
+ * P1 (sequential-repair): validate a stored capturePlan. A plan field that
+ * is PRESENT but structurally wrong or identity-inconsistent is a LOUD error
+ * — never silently treated as legacy (only a genuinely ABSENT field is
+ * legacy). Returns an error string on corruption, undefined when absent,
+ * and null when the plan is valid.
+ */
+function validateCapturePlan(
+  plan: unknown,
+  expected: {
+    attemptId: string;
+    sceneId: string;
+    learnerKey: string;
+    stageId: string;
+  },
+): string | undefined | null {
+  if (plan === undefined) return undefined; // legacy review — no plan field
+  if (plan === null || typeof plan !== 'object' || Array.isArray(plan)) {
+    return 'capturePlan present but not an object';
+  }
+  const header = plan as Partial<QuizCapturePlan>;
+  if (
+    header.planVersion !== 1 ||
+    typeof header.originOwner !== 'string' ||
+    typeof header.originEpisodeId !== 'string' ||
+    typeof header.attemptId !== 'string' ||
+    typeof header.sceneId !== 'string' ||
+    typeof header.learnerKey !== 'string' ||
+    !Array.isArray(header.items)
+  ) {
+    return 'capturePlan header missing or malformed (planVersion/owner/episode/attempt/scene/learner/items)';
+  }
+  if (header.attemptId !== expected.attemptId || header.sceneId !== expected.sceneId) {
+    return 'capturePlan header attempt/scene does not match this attempt';
+  }
+  if (header.learnerKey !== expected.learnerKey) {
+    return 'capturePlan header learner does not match this learner partition';
+  }
+  if (header.legacyExemptQuestions !== undefined) {
+    // P3 §4: the exemption baseline is an immutable set of non-empty ids —
+    // duplicates or a non-array make the whole plan corrupt (loud, never
+    // silently ignored: a malformed baseline could silently re-capture or
+    // silently exempt the wrong questions).
+    if (
+      !Array.isArray(header.legacyExemptQuestions) ||
+      header.legacyExemptQuestions.some((id) => typeof id !== 'string' || id === '') ||
+      new Set(header.legacyExemptQuestions).size !== header.legacyExemptQuestions.length
+    ) {
+      return 'capturePlan legacyExemptQuestions malformed (unique non-empty strings)';
+    }
+  }
+  for (const item of header.items as Array<Partial<QuizCapturePlanItem>>) {
+    if (
+      typeof item.questionId !== 'string' ||
+      typeof item.eventId !== 'string' ||
+      typeof item.recordToken !== 'string' ||
+      item.recordToken === '' ||
+      typeof item.payload !== 'object' ||
+      item.payload === null
+    ) {
+      return 'capturePlan item malformed (questionId/eventId/non-empty recordToken/payload)';
+    }
+    if (item.eventId !== planItemEventId(header.attemptId, item.questionId ?? '')) {
+      return 'capturePlan item eventId does not belong to this attempt/question';
+    }
+    const payload = item.payload as Partial<{
+      stageId: unknown;
+      sceneId: unknown;
+      eventId: unknown;
+      items: unknown;
+    }>;
+    if (payload.stageId !== expected.stageId) {
+      return 'capturePlan item payload stageId does not match this stage';
+    }
+    if (
+      payload.sceneId !== header.sceneId ||
+      payload.eventId !== item.eventId ||
+      !Array.isArray(payload.items)
+    ) {
+      return 'capturePlan item payload is not a frozen per-question capture snapshot';
+    }
+    // EXACTLY ONE inner item — it IS this question's event, never a batch.
+    const inner = payload.items as Array<Partial<{ questionId: unknown; eventId: unknown }>>;
+    if (
+      inner.length !== 1 ||
+      inner[0]?.questionId !== item.questionId ||
+      inner[0]?.eventId !== item.eventId
+    ) {
+      return 'capturePlan item payload must freeze exactly this question/event';
+    }
+  }
+  return null; // valid
+}
+
+/**
+ * The canonical per-question event id (P1 review): the SAME encoding the
+ * mistake-book client mints — the JSON tuple when it fits the 200-char
+ * budget, otherwise `ev:` + SHA-256 of the tuple. Plans and captures must
+ * agree bit-for-bit or long ids would diverge across a refresh.
+ */
+function planItemEventId(attemptId: string, questionId: string): string {
+  return questionEventId(attemptId, questionId);
+}
+
+/**
+ * Historical-exemption baseline for an attempt's first MODERN plan (P3 §4):
+ * when the attempt has NO plan yet (a real legacy review), every question
+ * ALREADY decided wrong in that historical review is exempt — its zero-re-
+ * capture fact must survive the modern upgrade. Once a plan exists, its own
+ * frozen baseline carries forward immutably. Only pre-existing DECIDED-wrong
+ * results count: a modern not-yet-enqueued wrong is never marked historical.
+ */
+export function legacyExemptQuestionIds(
+  prevPlan: QuizCapturePlan | null | undefined,
+  priorResults: ReadonlyArray<QuestionResult>,
+): string[] {
+  if (prevPlan) return prevPlan.legacyExemptQuestions ?? [];
+  return priorResults
+    .filter((result) => result.correct === false && result.status === 'incorrect')
+    .map((result) => result.questionId);
+}
+
 function attemptIdSegment(value: string): string {
   return encodeURIComponent(value);
 }
@@ -270,6 +451,17 @@ async function readLatestQuizAttemptState(
     const records = await store.listRecords(session.id, { sceneId: input.sceneId });
     const payload = asQuizPayload(records.at(-1));
     if (!payload) continue;
+    // P1: a present-but-corrupt plan is an ERROR (honest gate), only a truly
+    // absent plan keeps legacy semantics.
+    const planError = validateCapturePlan((payload as { capturePlan?: unknown }).capturePlan, {
+      attemptId: session.id,
+      sceneId: input.sceneId,
+      learnerKey,
+      stageId: input.stageId,
+    });
+    if (typeof planError === 'string') {
+      throw new Error(`quiz attempt ${JSON.stringify(session.id)}: ${planError}`);
+    }
     return {
       sessionId: session.id,
       status: session.status,
@@ -278,6 +470,7 @@ async function readLatestQuizAttemptState(
       ...(payload.phase === 'reviewed'
         ? { results: Array.isArray(payload.results) ? payload.results : [] }
         : {}),
+      ...(payload.capturePlan !== undefined ? { capturePlan: payload.capturePlan } : {}),
     };
   }
   return undefined;
@@ -392,6 +585,108 @@ export async function loadQuizAttemptState(
     );
   }
 
+  // Legacy completed-but-undecided repair (closing gate #5): a historical
+  // client completed a session whose latest review still holds an UNDECIDED
+  // verdict (correct:null / status 'ungraded'). Left as-is, a re-grade would
+  // ROLL OVER into a new attempt instead of appending the recovery to the
+  // original. Under the attempt lock: re-read the tail; only when it still
+  // proves the wrong completion (completed + undecided review tail) does the
+  // tail-CAS reactivate it. Concurrent tail changes re-read and re-verify;
+  // decided reviews and results-less historical completions are untouched,
+  // and no session or event id is ever created here.
+  if (state?.phase === 'reviewed' && state.status === 'completed') {
+    const undecidedState: QuizAttemptState | undefined = state;
+    const hasUndecided = (undecidedState.results ?? []).some(isExplicitlyUndecidedResult);
+    if (hasUndecided && undecidedState.results !== undefined) {
+      await withAttemptLock(rootAttemptId(undecidedState.sessionId), async () => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          // AUTHORITATIVE re-read inside the lock (repair review): if a real
+          // retry already exists for this learner/scene, the latest session
+          // is no longer our legacy root — never reopen the old one.
+          const authoritative = await readLatestQuizAttemptState(input, store, learnerKey);
+          if (
+            !authoritative ||
+            authoritative.sessionId !== undecidedState.sessionId ||
+            authoritative.phase !== 'reviewed' ||
+            authoritative.status !== 'completed'
+          ) {
+            state = authoritative ?? undefined;
+            return;
+          }
+          const session = await store.getSession(authoritative.sessionId);
+          if (!session || session.status !== 'completed') return;
+          // Partition/kind/scene re-verification on the session itself.
+          assertPartition(session, input.stageId, learnerKey);
+          if (session.kind !== 'quizAttempt') {
+            state = (await readLatestQuizAttemptState(input, store, learnerKey)) ?? undefined;
+            return;
+          }
+          const records = await store.listRecords(session.id, { sceneId: input.sceneId });
+          const tail = records.at(-1);
+          const tailPayload = asQuizPayload(tail);
+          if (
+            !tail ||
+            (tail.sceneId !== undefined && tail.sceneId !== input.sceneId) ||
+            !tailPayload ||
+            tailPayload.phase !== 'reviewed' ||
+            !Array.isArray(tailPayload.results) ||
+            !tailPayload.results.some(isExplicitlyUndecidedResult)
+          ) {
+            // Bail: tail changed or the completion is legitimate — the
+            // caller gets the CANONICAL current state, not the stale snapshot.
+            state = (await readLatestQuizAttemptState(input, store, learnerKey)) ?? undefined;
+            return;
+          }
+          // ATOMIC lineage guard (P4 final review + supplement): when the
+          // store provides setSessionStatusIfLatest, the "is this root still
+          // the latest RELEVANT attempt of this scene" precondition is
+          // validated INSIDE the status-write transaction (browser IDB /
+          // PostgreSQL advisory-lock serialization; the HTTP transport's
+          // server-side store enforces it over the wire). A child minted
+          // between the authoritative read and this write can never observe
+          // or adopt an incorrectly reactivated root — the obsolete
+          // activation NEVER COMMITS. Stores WITHOUT the method cannot
+          // provide the atomic precondition: the repair HONESTLY REFUSES to
+          // reactivate (no mutate-then-compensate window) and returns the
+          // canonical state.
+          const writeIfLatest = store.setSessionStatusIfLatest;
+          if (writeIfLatest === undefined) {
+            // Honest refusal on an unsupported store: never an unsafe write.
+            state = (await readLatestQuizAttemptState(input, store, learnerKey)) ?? undefined;
+            return;
+          }
+          let wrote: boolean;
+          try {
+            wrote = await writeIfLatest.call(
+              store,
+              session.id,
+              'active',
+              new Date().toISOString(),
+              {
+                expectedLastSeq: tail.seq,
+                relevantSceneId: input.sceneId,
+              },
+            );
+          } catch (error) {
+            if (error instanceof RuntimeAppendConflictError) continue; // tail raced: re-read
+            throw error;
+          }
+          if (!wrote) {
+            // A relevant newer sibling committed (a real retry of THIS
+            // scene): the old root was never touched — return the canonical
+            // newer state.
+            state = (await readLatestQuizAttemptState(input, store, learnerKey)) ?? undefined;
+            return;
+          }
+          state = (await readLatestQuizAttemptState(input, store, learnerKey)) ?? undefined;
+          return;
+        }
+        // CAS retries exhausted: still return the canonical current state.
+        state = (await readLatestQuizAttemptState(input, store, learnerKey)) ?? undefined;
+      });
+    }
+  }
+
   // Older shadow writers could append reviewed and crash before completing
   // the session. Replaying the same fact invokes the atomic tail-CAS repair.
   if (state?.phase === 'reviewed' && state.status === 'active') {
@@ -402,6 +697,10 @@ export async function loadQuizAttemptState(
         phase: 'reviewed',
         answers: state.answers,
         results: state.results ?? [],
+        // P1: the completion replay forwards the FULL modern plan — a
+        // shadow-written active review must not lose its capturePlan (that
+        // would silently downgrade a modern review to legacy semantics).
+        ...(state.capturePlan !== undefined ? { capturePlan: state.capturePlan } : {}),
       },
       { ...deps, store, learnerKey },
     );
@@ -409,7 +708,15 @@ export async function loadQuizAttemptState(
   }
 
   return {
-    attemptId: state?.status === 'active' ? state.sessionId : attemptId,
+    // The attemptId callers should USE going forward is the session the
+    // latest state itself lives in — including a COMPLETED retry child: the
+    // current answer's source identity must not reset to the root lineage
+    // after the child finishes (hydration, capture, and grade recovery all
+    // key on this id). Only a scene with no state at all falls back to the
+    // canonical root id. startNewAttempt callers still pass this id to
+    // recordQuizAttempt, which derives the root lineage itself, so retry
+    // minting is unchanged.
+    attemptId: state ? state.sessionId : attemptId,
     state,
   };
 }
@@ -428,6 +735,19 @@ function rolloverAttemptId(attemptId: string, index: number): string {
 
 function rootAttemptId(attemptId: string): string {
   return attemptId.replace(/(?::retry:\d+)+$/, '');
+}
+
+/**
+ * Explicitly undecided verdict (closing gate #5): no decided status AND a
+ * null correct. A legacy row whose status field claims a decision keeps its
+ * historical completed fact — only provably-undecided reviews reactivate.
+ */
+function isExplicitlyUndecidedResult(result: QuestionResult): boolean {
+  return (
+    result.correct !== true &&
+    result.correct !== false &&
+    (result.status === undefined || result.status === 'ungraded')
+  );
 }
 
 function compareSessionCreationOrder(left: RuntimeSession, right: RuntimeSession): number {
@@ -460,10 +780,39 @@ function assertPartition(session: RuntimeSession, stageId: string, learnerKey: s
  * Append one immutable quiz lifecycle fact. Calls for one attempt are serialized
  * so rapid draft writes cannot overtake submit or review writes.
  */
+
+/**
+ * A reviewed payload completes its session only when every result carries a
+ * DECIDED verdict. A review that still holds ungraded results keeps the
+ * attempt active, so grading recovery appends the decided review to the SAME
+ * session instead of minting a retry (the attempt identity — and the capture
+ * event ids that hang off it — must survive an unresolved grading). Legacy
+ * reviewed payloads without results keep completing: that is a historical
+ * fact, never rewritten.
+ */
+function completesAttempt(payload: QuizAttemptPayload): boolean {
+  if (payload.phase !== 'reviewed') return false;
+  if (payload.results === undefined) return true;
+  return payload.results.every((result) => result.correct === true || result.correct === false);
+}
+
+/**
+ * The typed outcome of one record write (r4 group 2): WHICH session the
+ * write landed on, and whether THIS call CREATED it. A retry transition
+ * turns this into the narrow child-creation receipt — the only legitimate
+ * source of the ephemeral original-operation capability for a re-answer.
+ */
+export interface QuizAttemptWriteOutcome {
+  /** The session this write landed on (the retry child when one was made). */
+  sessionId: string;
+  /** True only when THIS call's createSession call created the session. */
+  createdSession: boolean;
+}
+
 export async function recordQuizAttempt(
   input: QuizAttemptRecordInput,
   deps: QuizAttemptRuntimeDeps = {},
-): Promise<void> {
+): Promise<QuizAttemptWriteOutcome> {
   const store = deps.store ?? getRuntimeStore();
   const learnerKey = deps.learnerKey ?? (await getLearnerKey());
   const now = deps.now ?? (() => new Date().toISOString());
@@ -471,7 +820,7 @@ export async function recordQuizAttempt(
   const rootId = rootAttemptId(input.attemptId);
 
   return enqueue(store, rootId, () =>
-    withAttemptLock(rootId, async () => {
+    withAttemptLock(rootId, async (): Promise<QuizAttemptWriteOutcome> => {
       const timestamp = now();
       const latestState = input.startNewAttempt
         ? await readLatestQuizAttemptState(input, store, learnerKey)
@@ -485,10 +834,19 @@ export async function recordQuizAttempt(
         phase: input.phase,
         answers: input.answers,
         ...(input.results === undefined ? {} : { results: input.results }),
+        ...(input.capturePlan !== undefined ? { capturePlan: input.capturePlan } : {}),
       };
       let rolloverIndex = 0;
       let sessionId = input.attemptId;
       let originSession: RuntimeSession | undefined;
+      /**
+       * The EXACT session ids THIS call created (r4 closing group 2): the
+       * receipt is computed for the RETURNED target only — creation of X
+       * never transfers to an existing Y after an append/completion race
+       * rolls the target forward. Retrying the SAME created session after a
+       * tail-CAS conflict keeps its membership (the set is never cleared).
+       */
+      const createdSessionIds = new Set<string>();
 
       while (true) {
         let session = await store.getSession(sessionId);
@@ -505,6 +863,7 @@ export async function recordQuizAttempt(
               updatedAt: timestamp,
             });
             created = true;
+            createdSessionIds.add(sessionId);
           } catch (error) {
             // Without Web Locks, another tab may win the deterministic create
             // after our read. Re-read the winner instead of losing this write.
@@ -551,7 +910,8 @@ export async function recordQuizAttempt(
             // A child with a durable fact already represents the retry. An
             // empty child can remain after create succeeds but append fails;
             // fall through so this call writes the missing draft marker.
-            if (last?.phase === 'draft' && Object.keys(last.answers).length === 0) return;
+            if (last?.phase === 'draft' && Object.keys(last.answers).length === 0)
+              return { sessionId, createdSession: createdSessionIds.has(sessionId) };
             if (
               last &&
               authoritativeCompletedSession &&
@@ -571,22 +931,28 @@ export async function recordQuizAttempt(
         }
 
         if (session.status === 'active') {
-          if (last && PHASE_ORDER[payload.phase] < PHASE_ORDER[last.phase]) return;
+          if (last && PHASE_ORDER[payload.phase] < PHASE_ORDER[last.phase])
+            return { sessionId, createdSession: createdSessionIds.has(sessionId) };
 
           // An active session with a reviewed tail can exist from an older
           // client that appended before its separate completion write. Heal
           // only the status, guarded by the record tail in the same transaction.
-          if (last && samePayload(last, payload) && payload.phase !== 'reviewed') return;
+          if (last && samePayload(last, payload) && payload.phase !== 'reviewed')
+            return { sessionId, createdSession: createdSessionIds.has(sessionId) };
           if (last && lastRecord && samePayload(last, payload)) {
-            try {
-              await store.setSessionStatus(sessionId, 'completed', timestamp, {
-                expectedLastSeq: lastRecord.seq,
-              });
-            } catch (error) {
-              if (error instanceof RuntimeAppendConflictError) continue;
-              throw error;
+            // An unresolved review replayed verbatim stays active — the
+            // recovery is still owed. Only a decided review completes.
+            if (completesAttempt(payload)) {
+              try {
+                await store.setSessionStatus(sessionId, 'completed', timestamp, {
+                  expectedLastSeq: lastRecord.seq,
+                });
+              } catch (error) {
+                if (error instanceof RuntimeAppendConflictError) continue;
+                throw error;
+              }
             }
-            return;
+            return { sessionId, createdSession: createdSessionIds.has(sessionId) };
           }
 
           try {
@@ -600,7 +966,7 @@ export async function recordQuizAttempt(
               },
               {
                 expectedLastSeq: lastRecord?.seq ?? null,
-                ...(payload.phase === 'reviewed'
+                ...(completesAttempt(payload)
                   ? { sessionTransition: { status: 'completed' as const, updatedAt: timestamp } }
                   : {}),
               },
@@ -615,16 +981,18 @@ export async function recordQuizAttempt(
             // the loop so the immutable completed attempt rolls forward.
             continue;
           }
-          return;
+          return { sessionId, createdSession: createdSessionIds.has(sessionId) };
         }
 
-        if (last && samePayload(last, payload)) return;
+        if (last && samePayload(last, payload)) {
+          return { sessionId, createdSession: createdSessionIds.has(sessionId) };
+        }
         if (
           last &&
           PHASE_ORDER[payload.phase] < PHASE_ORDER[last.phase] &&
           sameAnswers(payload.answers, last.answers)
         ) {
-          return;
+          return { sessionId, createdSession: createdSessionIds.has(sessionId) };
         }
 
         rolloverIndex += 1;

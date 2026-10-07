@@ -17,6 +17,7 @@ import type {
   ValidationResult,
 } from '@openmaic/dsl';
 import { assertJsonValue } from '../runtime/json-value.js';
+import { LineageGuardUnsupportedHttpError, RuntimeHttpError } from './http-error.js';
 import type {
   RuntimeAppendOptions,
   RuntimePayloadValidator,
@@ -91,17 +92,6 @@ interface ErrorBody {
     message: string;
     details?: unknown;
   };
-}
-
-class RuntimeHttpError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-    readonly details?: unknown,
-  ) {
-    super(message);
-  }
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -370,6 +360,27 @@ function mappedError(error: unknown): { status: number; body: ErrorBody } {
       },
     };
   }
+  // The ONE deliberate ≥500 response that must reach the client: the honest
+  // unsupported-guard refusal. FIXED literal public fields — never content
+  // read off the error instance — so this narrow sentinel cannot become a
+  // disclosure channel.
+  if (error instanceof LineageGuardUnsupportedHttpError) {
+    return {
+      status: 501,
+      body: {
+        error: {
+          code: 'LINEAGE_GUARD_UNSUPPORTED',
+          message:
+            '@openmaic/storage: this runtime store does not support the atomic lineage guard',
+        },
+      },
+    };
+  }
+  // Handler-authored 4xx status codes pass through with their own identity.
+  // A RuntimeHttpError at ≥500 — like ANY other internal error below — is
+  // REDACTED to the generic INTERNAL_ERROR: an internal failure's message and
+  // details (driver text, DSNs, stack-adjacent data) must never reach the
+  // client regardless of which layer authored the error.
   if (error instanceof RuntimeHttpError && error.status < 500) {
     return {
       status: error.status,
@@ -478,13 +489,63 @@ async function route(
     }
     if (method === 'PATCH' && parts.length === 4 && parts[3] === 'status') {
       const body = await readJson<
-        { status: RuntimeSessionStatus; updatedAt: string } & RuntimeTailOptions
+        {
+          status: RuntimeSessionStatus;
+          updatedAt: string;
+          latestOnly?: unknown;
+          relevantSceneId?: unknown;
+        } & RuntimeTailOptions
       >(req, options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
       const session = await writableSession(store, principal, sessionId);
       validationError(
         validateRuntimeSession({ ...session, status: body.status, updatedAt: body.updatedAt }),
         `@openmaic/storage: invalid runtime session ${JSON.stringify(sessionId)}`,
       );
+      if (body.latestOnly !== undefined && typeof body.latestOnly !== 'boolean') {
+        throw validationFailure('latestOnly must be a boolean when provided');
+      }
+      if (
+        body.relevantSceneId !== undefined &&
+        (typeof body.relevantSceneId !== 'string' || body.relevantSceneId === '')
+      ) {
+        throw validationFailure('relevantSceneId must be a non-empty string when provided');
+      }
+      if (body.latestOnly === true) {
+        // The atomic lineage guard: the server-side store evaluates the
+        // RELEVANT newer-sibling precondition inside its own write
+        // transaction. Stores without the capability honestly refuse the
+        // guarded form instead of silently downgrading to an unsafe write.
+        const guarded = store.setSessionStatusIfLatest;
+        if (guarded === undefined) {
+          // The deliberate honest refusal: a dedicated sentinel (not a bare
+          // RuntimeHttpError) so ≥500 redaction everywhere else stays intact
+          // while this one capability answer keeps its fixed public fields.
+          throw new LineageGuardUnsupportedHttpError();
+        }
+        let wrote: boolean;
+        try {
+          wrote = await guarded.call(store, sessionId, body.status, body.updatedAt, {
+            ...(body.expectedLastSeq === undefined
+              ? {}
+              : { expectedLastSeq: body.expectedLastSeq }),
+            ...(body.relevantSceneId === undefined
+              ? {}
+              : { relevantSceneId: body.relevantSceneId }),
+          });
+        } catch (error) {
+          await rethrowClassifiedSessionWriteFailure(store, principal, sessionId, error);
+          throw error;
+        }
+        if (!wrote) {
+          throw new RuntimeHttpError(
+            409,
+            'LINEAGE_ADVANCED',
+            `@openmaic/storage: session ${JSON.stringify(sessionId)} lineage already advanced`,
+          );
+        }
+        sendNoContent(res);
+        return;
+      }
       try {
         await store.setSessionStatus(sessionId, body.status, body.updatedAt, {
           ...(body.expectedLastSeq === undefined ? {} : { expectedLastSeq: body.expectedLastSeq }),
@@ -692,7 +753,8 @@ export function createRuntimeHttpHandler(
       }
       if (
         (!(error instanceof RuntimeHttpError) || error.status >= 500) &&
-        !(error instanceof RuntimeAppendConflictError)
+        !(error instanceof RuntimeAppendConflictError) &&
+        !(error instanceof LineageGuardUnsupportedHttpError)
       ) {
         console.error('@openmaic/storage: Runtime HTTP handler internal error', error);
       }

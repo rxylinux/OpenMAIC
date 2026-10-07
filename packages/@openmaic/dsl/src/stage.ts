@@ -211,6 +211,8 @@ export interface QuizQuestion {
   commentPrompt?: string; // Grading guidance for text questions
   hasAnswer?: boolean; // Whether auto-grading is possible
   points?: number; // Points per question (default 1)
+  /** The single tested knowledge point, e.g. "一元二次方程判别式". Drives the mistake book's same-point practice. */
+  knowledgePoint?: string;
 }
 
 /**

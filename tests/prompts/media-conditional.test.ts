@@ -25,6 +25,7 @@ function buildOutlinePrompt(
     pdfContent: 'None',
     availableImages: flags.hasSourceImages ? '- img_1: water cycle diagram' : 'No images available',
     userProfile: '',
+    difficultyPreference: '',
     researchContext: 'None',
     teacherContext: '',
     hasSourceImages: flags.hasSourceImages ?? false,

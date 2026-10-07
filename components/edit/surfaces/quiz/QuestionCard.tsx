@@ -221,6 +221,19 @@ export function QuestionCard({ question: q, index, expanded, onToggle }: Props) 
             </Field>
           </div>
 
+          {/* Knowledge point (all types) — drives the mistake book's same-point practice */}
+          <Field label={t('edit.quiz.knowledgePointLabel')}>
+            <Input
+              value={q.knowledgePoint ?? ''}
+              onPointerDown={stopDrag}
+              onChange={(e) =>
+                typeQuizQuestion(q.id, { knowledgePoint: e.target.value }, `${q.id}:kp`)
+              }
+              placeholder={t('edit.quiz.knowledgePointPlaceholder')}
+              className={FOCUS}
+            />
+          </Field>
+
           {/* Options (choice questions only) */}
           {choice && (
             <Field label={t('edit.quiz.optionsLabel')}>

@@ -38,6 +38,8 @@ import { splitLongSpeechActions } from '@/lib/audio/tts-utils';
 import { isGeneratedMediaPlaceholder } from '@/lib/media/media-ref';
 import { resolveImageSize } from '@/lib/server/image-sizing';
 import { VOXCPM_AUTO_VOICE_ID, VOXCPM_TTS_PROVIDER_ID } from '@/lib/audio/voxcpm';
+import { managedMediaProviderFetch } from '@/lib/server/media-provider-fetch';
+import { fetchProviderResultUrl } from '@/lib/server/provider-result-fetch';
 
 const log = createLogger('ClassroomMedia');
 
@@ -62,16 +64,58 @@ async function ensureDir(dir: string) {
 }
 
 const DOWNLOAD_TIMEOUT_MS = 120_000; // 2 minutes
-const DOWNLOAD_MAX_SIZE = 100 * 1024 * 1024; // 100 MB
+export const DOWNLOAD_MAX_SIZE = 100 * 1024 * 1024; // 100 MB
 
-async function downloadToBuffer(url: string): Promise<Buffer> {
-  const resp = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+/**
+ * Download a provider-returned media URL into a buffer.
+ *
+ * The URL comes from the provider's response (not configuration), so it is
+ * held to the strict public policy: `data:` URLs decode locally, anything
+ * else must be public HTTPS; the strict transport re-validates redirect hops
+ * and pins connect-time DNS, and the streamed read is capped so the body is
+ * never buffered past the limit.
+ */
+export async function downloadToBuffer(url: string): Promise<Buffer> {
+  const resp = await fetchProviderResultUrl(url, {
+    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+    maxBytes: DOWNLOAD_MAX_SIZE,
+  });
   if (!resp.ok) throw new Error(`Download failed: ${resp.status} ${resp.statusText}`);
   const contentLength = Number(resp.headers.get('content-length') || 0);
   if (contentLength > DOWNLOAD_MAX_SIZE) {
     throw new Error(`File too large: ${contentLength} bytes (max ${DOWNLOAD_MAX_SIZE})`);
   }
-  return Buffer.from(await resp.arrayBuffer());
+
+  const body = resp.body;
+  if (!body) {
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.byteLength > DOWNLOAD_MAX_SIZE) {
+      throw new Error(`File too large: ${buf.byteLength} bytes (max ${DOWNLOAD_MAX_SIZE})`);
+    }
+    return buf;
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > DOWNLOAD_MAX_SIZE) {
+        throw new Error(`File too large: ${total} bytes (max ${DOWNLOAD_MAX_SIZE})`);
+      }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks);
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 function mediaServingUrl(baseUrl: string, classroomId: string, subPath: string): string {
@@ -129,7 +173,15 @@ export async function generateMediaForClassroom(
         const model = resolveImageModel(providerId) ?? providerConfig?.models?.[0]?.id;
 
         const result = await generateImage(
-          { providerId, apiKey, baseUrl: resolveImageBaseUrl(providerId), model },
+          {
+            providerId,
+            apiKey,
+            baseUrl: resolveImageBaseUrl(providerId),
+            model,
+            // Server-internal generation resolves providers from server config
+            // only: the pinned managed transport applies.
+            fetchImpl: managedMediaProviderFetch,
+          },
           resolveImageSize(
             { prompt: req.prompt, aspectRatio: req.aspectRatio || '16:9' },
             { providerId, modelId: model },
@@ -143,7 +195,26 @@ export async function generateMediaForClassroom(
           ext = 'png';
         } else if (result.url) {
           buf = await downloadToBuffer(result.url);
-          const urlExt = path.extname(new URL(result.url).pathname).replace('.', '');
+          // A data: URL carries its type in the MIME (some adapters inline the
+          // result); a network URL carries it in the path extension.
+          let urlExt = '';
+          if (result.url.startsWith('data:')) {
+            const mime = result.url.slice(5).split(';')[0]?.toLowerCase();
+            urlExt =
+              mime === 'image/jpeg'
+                ? 'jpg'
+                : mime === 'image/webp'
+                  ? 'webp'
+                  : mime === 'image/png'
+                    ? 'png'
+                    : '';
+          } else {
+            try {
+              urlExt = path.extname(new URL(result.url).pathname).replace('.', '');
+            } catch {
+              urlExt = '';
+            }
+          }
           ext = ['png', 'jpg', 'jpeg', 'webp'].includes(urlExt) ? urlExt : 'png';
         } else {
           log.warn(`Image generation returned no data for ${req.elementId}`);
@@ -184,7 +255,15 @@ export async function generateMediaForClassroom(
         });
 
         const result = await generateVideo(
-          { providerId, apiKey, baseUrl: resolveVideoBaseUrl(providerId), model },
+          {
+            providerId,
+            apiKey,
+            baseUrl: resolveVideoBaseUrl(providerId),
+            model,
+            // Server-internal generation resolves providers from server config
+            // only: the pinned managed transport applies.
+            fetchImpl: managedMediaProviderFetch,
+          },
           normalized,
         );
 

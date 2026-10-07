@@ -369,6 +369,87 @@ describe('generation and deck tools', () => {
     expect(prompts[0]).toContain('mindmap');
   });
 
+  it('passes quizConfig through to quiz generation with short_answer normalized', async () => {
+    const current = state(document([]));
+    const prompts: string[] = [];
+    let calls = 0;
+    const aiCall = vi.fn(async (_system: string, user: string) => {
+      calls += 1;
+      prompts.push(user);
+      return calls === 1
+        ? JSON.stringify([
+            { id: 'q1', type: 'single', question: 'Q?', options: ['A', 'B'], answer: ['A'] },
+          ])
+        : JSON.stringify([{ type: 'text', content: 'Narration' }]);
+    });
+    const generate = find(buildGenerationTools(deps(current.store, { aiCall })), 'generate_scene');
+    const response = await generate.execute('call', {
+      stageId: 'stage-test',
+      order: 1,
+      title: 'After-Class Practice',
+      type: 'quiz',
+      brief: 'Whole-course wrap-up',
+      quizConfig: {
+        questionCount: 6,
+        difficulty: 'hard',
+        questionTypes: ['single', 'multiple', 'short_answer'],
+      },
+    } as never);
+    expect(response).not.toMatchObject({ isError: true });
+    expect(current.get()?.scenes[0]).toMatchObject({ type: 'quiz' });
+    expect(prompts[0]).toContain('Question Count: 6');
+    expect(prompts[0]).toContain('Difficulty: hard');
+    expect(prompts[0]).toContain('Question Types: single, multiple, text');
+    expect(prompts[0]).not.toContain('short_answer');
+  });
+
+  it('rejects quizConfig on non-quiz pages without writing anything', async () => {
+    const current = state(document([]));
+    const generate = find(buildGenerationTools(deps(current.store)), 'generate_scene');
+    const response = await generate.execute('call', {
+      stageId: 'stage-test',
+      order: 1,
+      title: 'Slide',
+      type: 'slide',
+      brief: 'A plain slide',
+      quizConfig: { questionCount: 3, difficulty: 'easy', questionTypes: ['single'] },
+    } as never);
+    expect(response).toMatchObject({
+      isError: true,
+      details: { error: 'quiz-config-requires-quiz' },
+    });
+    expect(current.get()?.scenes).toHaveLength(0);
+  });
+
+  it('validates quizConfig through the tool schema', () => {
+    const generate = find(buildGenerationTools(deps(state(document([])).store)), 'generate_scene');
+    const base = { stageId: 'stage-test', order: 1, title: 'Title', type: 'quiz', brief: 'Brief' };
+    expect(
+      Value.Check(generate.parameters, {
+        ...base,
+        quizConfig: { questionCount: 6, difficulty: 'hard', questionTypes: ['single', 'text'] },
+      }),
+    ).toBe(true);
+    expect(
+      Value.Check(generate.parameters, {
+        ...base,
+        quizConfig: { questionCount: 99, difficulty: 'hard', questionTypes: ['single'] },
+      }),
+    ).toBe(false);
+    expect(
+      Value.Check(generate.parameters, {
+        ...base,
+        quizConfig: { questionCount: 6, difficulty: 'extreme', questionTypes: ['single'] },
+      }),
+    ).toBe(false);
+    expect(
+      Value.Check(generate.parameters, {
+        ...base,
+        quizConfig: { questionCount: 6, difficulty: 'hard', questionTypes: [] },
+      }),
+    ).toBe(false);
+  });
+
   it('falls back to a simulation widget when interactive generation omits widgetType', async () => {
     const current = state(document([]));
     let calls = 0;

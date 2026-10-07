@@ -165,47 +165,74 @@ async function submit(sessionId: string): Promise<void> {
 }
 
 describe('renaming a chat from its row', () => {
-  it('shows the name the user gave it, and opens the box on that name', async () => {
-    await renderRail();
-    expect(byTestId(`pro-nav-session-${NAMED}`)?.textContent).toContain('期末复习课');
-    expect((await openRename(NAMED)).value).toBe('期末复习课');
-  });
+  // Per-test wall-clock budget: the FIRST render pulls the whole WorkspaceRail
+  // tree through jsdom inside act() — 3.2–3.6s solo, and over the default 5s
+  // under full-suite worker load (observed flapping in the full-workspace run
+  // while every assertion passes in isolation). The budget reflects measured
+  // render cost; no assertion or waiting behavior is changed by it.
+  const RENDER_BUDGET_MS = 15_000;
 
-  it('opens EMPTY for a chat with no name of its own', async () => {
-    await renderRail();
-    // Not pre-filled with the whole first message to delete; the placeholder is
-    // what says where the title comes from today.
-    const input = await openRename(UNNAMED);
-    expect(input.value).toBe('');
-    expect(input.placeholder).toBe('再来一节');
-  });
+  it(
+    'shows the name the user gave it, and opens the box on that name',
+    async () => {
+      await renderRail();
+      expect(byTestId(`pro-nav-session-${NAMED}`)?.textContent).toContain('期末复习课');
+      expect((await openRename(NAMED)).value).toBe('期末复习课');
+    },
+    RENDER_BUDGET_MS,
+  );
 
-  it('sends the new name and closes the row', async () => {
-    const { onRenameSession } = await renderRail();
-    await typeInto(await openRename(UNNAMED), '  第二节  ');
-    await submit(UNNAMED);
-    expect(onRenameSession).toHaveBeenCalledWith(UNNAMED, '  第二节  ');
-    expect(byTestId(`pro-nav-session-rename-${UNNAMED}-input`)).toBeNull();
-  });
+  it(
+    'opens EMPTY for a chat with no name of its own',
+    async () => {
+      await renderRail();
+      // Not pre-filled with the whole first message to delete; the placeholder is
+      // what says where the title comes from today.
+      const input = await openRename(UNNAMED);
+      expect(input.value).toBe('');
+      expect(input.placeholder).toBe('再来一节');
+    },
+    RENDER_BUDGET_MS,
+  );
 
-  it('accepts an empty box — that is how the derived title comes back', async () => {
-    const { onRenameSession } = await renderRail();
-    await typeInto(await openRename(NAMED), '');
-    // The confirm control stays live, unlike a folder's (whose name is required).
-    expect(byTestId(`pro-nav-session-rename-${NAMED}-confirm`)?.hasAttribute('disabled')).toBe(
-      false,
-    );
-    await submit(NAMED);
-    expect(onRenameSession).toHaveBeenCalledWith(NAMED, '');
-  });
+  it(
+    'sends the new name and closes the row',
+    async () => {
+      const { onRenameSession } = await renderRail();
+      await typeInto(await openRename(UNNAMED), '  第二节  ');
+      await submit(UNNAMED);
+      expect(onRenameSession).toHaveBeenCalledWith(UNNAMED, '  第二节  ');
+      expect(byTestId(`pro-nav-session-rename-${UNNAMED}-input`)).toBeNull();
+    },
+    RENDER_BUDGET_MS,
+  );
 
-  it('leaves the name alone on Escape', async () => {
-    const { onRenameSession } = await renderRail();
-    const input = await openRename(NAMED);
-    await act(async () => {
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-    });
-    expect(onRenameSession).not.toHaveBeenCalled();
-    expect(byTestId(`pro-nav-session-rename-${NAMED}-input`)).toBeNull();
-  });
+  it(
+    'accepts an empty box — that is how the derived title comes back',
+    async () => {
+      const { onRenameSession } = await renderRail();
+      await typeInto(await openRename(NAMED), '');
+      // The confirm control stays live, unlike a folder's (whose name is required).
+      expect(byTestId(`pro-nav-session-rename-${NAMED}-confirm`)?.hasAttribute('disabled')).toBe(
+        false,
+      );
+      await submit(NAMED);
+      expect(onRenameSession).toHaveBeenCalledWith(NAMED, '');
+    },
+    RENDER_BUDGET_MS,
+  );
+
+  it(
+    'leaves the name alone on Escape',
+    async () => {
+      const { onRenameSession } = await renderRail();
+      const input = await openRename(NAMED);
+      await act(async () => {
+        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      });
+      expect(onRenameSession).not.toHaveBeenCalled();
+      expect(byTestId(`pro-nav-session-rename-${NAMED}-input`)).toBeNull();
+    },
+    RENDER_BUDGET_MS,
+  );
 });

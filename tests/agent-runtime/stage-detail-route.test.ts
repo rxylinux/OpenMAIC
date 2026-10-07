@@ -93,6 +93,48 @@ describe('PATCH /api/stages/[id]', () => {
     expect(saved.scenes.map((scene) => scene.id)).toEqual(['scene-1', 'scene-2']);
   });
 
+  it('combines a rename with classification in one PATCH: name echoed, both saved atomically', async () => {
+    const response = await call(
+      PATCH,
+      jsonInit('PATCH', {
+        name: '  Math Workbook  ',
+        subject: 'math',
+        gradeSemester: 'grade-6-up',
+      }),
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ success: true, name: 'Math Workbook' });
+
+    // ONE atomic document save carries the rename AND both classifications;
+    // scenes/outline survive untouched.
+    expect(mocks.fakeStore!.saveCalls).toHaveLength(1);
+    const saved = mocks.fakeStore!.saveCalls[0]!;
+    expect(saved.stage).toMatchObject({
+      name: 'Math Workbook',
+      subject: 'math',
+      gradeSemester: 'grade-6-up',
+    });
+    expect(saved.scenes.map((scene) => scene.id)).toEqual(['scene-1', 'scene-2']);
+  });
+
+  it('classification-only PATCH keeps the success-only response shape (no name key)', async () => {
+    const response = await call(
+      PATCH,
+      jsonInit('PATCH', { subject: 'english', gradeSemester: 'other' }),
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ success: true }); // exactly — no name
+
+    expect(mocks.fakeStore!.saveCalls).toHaveLength(1);
+    const saved = mocks.fakeStore!.saveCalls[0]!;
+    expect(saved.stage).toMatchObject({
+      name: 'Original Name', // untouched by a classification-only patch
+      subject: 'english',
+      gradeSemester: 'other',
+    });
+    expect(saved.scenes.map((scene) => scene.id)).toEqual(['scene-1', 'scene-2']);
+  });
+
   it.each([
     [
       'non-JSON body',

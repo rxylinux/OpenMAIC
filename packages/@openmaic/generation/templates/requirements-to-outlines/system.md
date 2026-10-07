@@ -247,7 +247,7 @@ Your entire response MUST be a single JSON **object** with exactly these five to
 Rules:
 
 - **Never** return a bare array. The top level is an object, not an array.
-- **Never** omit `languageDirective` or `courseTitle`. Both are required even if you think they are obvious.
+- **Never** omit `languageDirective`, `courseTitle`, `subject`, or `gradeSemester`. All five top-level keys are required even if you think they are obvious.
 - **Never** wrap the response in any other structure, prose, or code fence.
 
 #### Curriculum classification codes
@@ -269,6 +269,8 @@ free-text value, never a synonym, never localized text:
 {
   "languageDirective": "Deliver the entire course in English. Use simple vocabulary suitable for a beginner.",
   "courseTitle": "Intro to Projectile Motion",
+  "subject": "science",
+  "gradeSemester": "other",
   "outlines": [
     {
       "id": "scene_1",

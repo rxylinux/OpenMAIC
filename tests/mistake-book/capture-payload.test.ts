@@ -41,6 +41,7 @@ describe('buildMistakeCapturePayload', () => {
     const payload = buildMistakeCapturePayload(questions, answers, results(['q1']), {
       stageId: 's1',
       stageName: '一年级数学',
+      attemptId: 'attempt-1',
       sceneId: 'sc1',
       sceneTitle: '课后练习',
       sceneOrder: 5,
@@ -69,6 +70,7 @@ describe('buildMistakeCapturePayload', () => {
     const payload = buildMistakeCapturePayload(questions, answers, results(['q1']), {
       stageId: 's1',
       stageName: '一年级数学',
+      attemptId: 'attempt-1',
       sceneId: 'sc1',
     });
     expect(payload!.subject).toBeUndefined();
@@ -80,6 +82,7 @@ describe('buildMistakeCapturePayload', () => {
     const payload = buildMistakeCapturePayload(questions, answers, results([]), {
       stageId: 's1',
       stageName: '一年级数学',
+      attemptId: 'attempt-1',
       sceneId: 'sc1',
     });
     expect(payload).toBeNull();
@@ -90,13 +93,35 @@ describe('buildMistakeCapturePayload', () => {
       questions,
       answers,
       results(['q2'], '答“一”不满足大于 3。'),
-      { stageId: 's1', stageName: '一年级数学', sceneId: 'sc1' },
+      { stageId: 's1', stageName: '一年级数学', attemptId: 'attempt-1', sceneId: 'sc1' },
     );
 
     const item = payload!.items.find((entry) => entry.questionId === 'q2')!;
     expect(item.analysis).toBe('参考答案：4、5、6……\n\n答“一”不满足大于 3。');
     expect(item.correctAnswer).toBeUndefined();
     expect(item.userAnswer).toBe('一');
+  });
+
+  it('never captures ungraded results, including legacy null-verdict rows', () => {
+    const ungraded: QuestionResult = {
+      questionId: 'q1',
+      correct: null,
+      status: 'ungraded',
+      earned: 0,
+    };
+    const legacyNull: QuestionResult = {
+      questionId: 'q2',
+      correct: null,
+      status: 'incorrect', // pre-'ungraded' runtime shape
+      earned: 2,
+    };
+    const payload = buildMistakeCapturePayload(
+      questions,
+      { q1: 'A', q2: '一' },
+      [ungraded, legacyNull],
+      { stageId: 's1', stageName: '课', attemptId: 'attempt-1', sceneId: 'sc1' },
+    );
+    expect(payload).toBeNull();
   });
 
   it('skips results whose question is missing from the scene', () => {
@@ -109,6 +134,7 @@ describe('buildMistakeCapturePayload', () => {
     const payload = buildMistakeCapturePayload(questions, answers, [orphan], {
       stageId: 's1',
       stageName: '一年级数学',
+      attemptId: 'attempt-1',
       sceneId: 'sc1',
     });
     expect(payload).toBeNull();

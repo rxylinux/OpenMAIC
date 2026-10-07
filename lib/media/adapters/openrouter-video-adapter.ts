@@ -27,6 +27,8 @@ import type {
   VideoGenerationResult,
 } from '../types';
 import { runPolledTask, type PollResult } from '../polled-task';
+import { mediaFetchFor } from '../media-fetch';
+import type { MediaProviderFetch } from '../types';
 import { requireModel } from '../require-model';
 import { openRouterBaseUrl, openRouterHeaders } from './openrouter-image-adapter';
 
@@ -62,17 +64,21 @@ interface OpenRouterVideoJob {
 
 /** Download the finished clip and inline it as a data URL. */
 async function fetchVideoDataUrl(
+  fetchImpl: MediaProviderFetch,
   baseUrl: string,
   apiKey: string,
   jobId: string,
   signal?: AbortSignal,
 ): Promise<string> {
-  const response = await fetch(`${baseUrl}/videos/${encodeURIComponent(jobId)}/content?index=0`, {
-    method: 'GET',
-    headers: { Authorization: `Bearer ${apiKey}` },
-    redirect: 'manual',
-    ...(signal ? { signal } : {}),
-  });
+  const response = await fetchImpl(
+    `${baseUrl}/videos/${encodeURIComponent(jobId)}/content?index=0`,
+    {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      redirect: 'manual',
+      ...(signal ? { signal } : {}),
+    },
+  );
   if (!response.ok) {
     const text = await response.text().catch(() => '');
     throw new Error(`OpenRouter video download failed (${response.status}): ${text}`);
@@ -84,6 +90,7 @@ async function fetchVideoDataUrl(
 
 /** Map a polled job onto the shared polled-task result union. */
 async function resolveJob(
+  fetchImpl: MediaProviderFetch,
   job: OpenRouterVideoJob,
   baseUrl: string,
   apiKey: string,
@@ -92,7 +99,7 @@ async function resolveJob(
   switch (job.status) {
     case 'completed': {
       if (!job.id) throw new Error('OpenRouter returned a completed job without an id');
-      const url = await fetchVideoDataUrl(baseUrl, apiKey, job.id, options.signal);
+      const url = await fetchVideoDataUrl(fetchImpl, baseUrl, apiKey, job.id, options.signal);
       const { width, height } = getDimensions(options.aspectRatio);
       return {
         status: 'done',
@@ -112,6 +119,7 @@ async function resolveJob(
 }
 
 async function submitVideoJob(
+  fetchImpl: MediaProviderFetch,
   baseUrl: string,
   apiKey: string,
   model: string,
@@ -122,7 +130,7 @@ async function submitVideoJob(
   if (options.duration) body.duration = options.duration;
   if (options.resolution) body.resolution = options.resolution;
 
-  const response = await fetch(`${baseUrl}/videos`, {
+  const response = await fetchImpl(`${baseUrl}/videos`, {
     method: 'POST',
     headers: openRouterHeaders(apiKey),
     redirect: 'manual',
@@ -138,12 +146,13 @@ async function submitVideoJob(
 }
 
 async function pollVideoJob(
+  fetchImpl: MediaProviderFetch,
   baseUrl: string,
   apiKey: string,
   jobId: string,
   signal?: AbortSignal,
 ): Promise<OpenRouterVideoJob> {
-  const response = await fetch(`${baseUrl}/videos/${encodeURIComponent(jobId)}`, {
+  const response = await fetchImpl(`${baseUrl}/videos/${encodeURIComponent(jobId)}`, {
     method: 'GET',
     headers: openRouterHeaders(apiKey),
     redirect: 'manual',
@@ -168,10 +177,11 @@ export async function testOpenRouterVideoConnectivity(
   config: VideoGenerationConfig,
 ): Promise<{ success: boolean; message: string }> {
   const baseUrl = openRouterBaseUrl(config.baseUrl);
+  const fetchImpl = mediaFetchFor(config);
 
   let response: Response;
   try {
-    response = await fetch(`${baseUrl}/key`, {
+    response = await fetchImpl(`${baseUrl}/key`, {
       method: 'GET',
       redirect: 'manual',
       headers: openRouterHeaders(config.apiKey),
@@ -190,7 +200,7 @@ export async function testOpenRouterVideoConnectivity(
     };
   }
 
-  const text = await response.text().catch(() => '');
+  await response.body?.cancel().catch(() => undefined);
   if (response.status === 401 || response.status === 403) {
     return {
       success: false,
@@ -199,7 +209,7 @@ export async function testOpenRouterVideoConnectivity(
   }
   return {
     success: false,
-    message: `OpenRouter video connectivity failed (${response.status}): ${text}`,
+    message: `OpenRouter video connectivity failed (${response.status})`,
   };
 }
 
@@ -208,20 +218,27 @@ export async function generateWithOpenRouterVideo(
   options: VideoGenerationOptions,
 ): Promise<VideoGenerationResult> {
   const baseUrl = openRouterBaseUrl(config.baseUrl);
+  const fetchImpl = mediaFetchFor(config);
   const model = requireModel(config.model, 'OpenRouter Video');
 
   return runPolledTask<VideoGenerationResult>({
     submit: async () => {
-      const job = await submitVideoJob(baseUrl, config.apiKey, model, options);
+      const job = await submitVideoJob(fetchImpl, baseUrl, config.apiKey, model, options);
       if (!job.id) throw new Error('OpenRouter returned a video job without an id');
       // A job can already be terminal on submit; only 'pending'/'in_progress' waits.
-      const resolved = await resolveJob(job, baseUrl, config.apiKey, options);
+      const resolved = await resolveJob(fetchImpl, job, baseUrl, config.apiKey, options);
       return resolved.status === 'pending' ? { status: 'submitted', taskId: job.id } : resolved;
     },
     poll: async (jobId) => {
-      const job = await pollVideoJob(baseUrl, config.apiKey, jobId, options.signal);
+      const job = await pollVideoJob(fetchImpl, baseUrl, config.apiKey, jobId, options.signal);
       // Poll responses may omit the id; keep the one we submitted with.
-      return resolveJob({ ...job, id: job.id || jobId }, baseUrl, config.apiKey, options);
+      return resolveJob(
+        fetchImpl,
+        { ...job, id: job.id || jobId },
+        baseUrl,
+        config.apiKey,
+        options,
+      );
     },
     intervalMs: POLL_INTERVAL_MS,
     maxAttempts: MAX_POLL_ATTEMPTS,

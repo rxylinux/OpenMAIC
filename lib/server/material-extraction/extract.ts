@@ -15,6 +15,7 @@ import {
 } from '@/lib/document';
 import {
   getServerPDFProviders,
+  isServerConfiguredProvider,
   resolvePDFApiKey,
   resolvePDFBaseUrl,
   resolveServerMediaExtractorConfig,
@@ -214,6 +215,9 @@ export async function extractClaimedSessionMaterial(
           apiKey: resolvePDFApiKey(provider.id) || undefined,
           baseUrl: resolvePDFBaseUrl(provider.id),
           allowEnvFallback: true,
+          // Server-side material extraction resolves credentials from server
+          // config only: the endpoint is operator configuration.
+          managed: isServerConfiguredProvider('pdf', provider.id),
         },
       });
       selected = provider;

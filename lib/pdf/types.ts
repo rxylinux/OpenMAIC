@@ -37,6 +37,19 @@ export interface PDFParserConfig {
   allowEnvFallback?: boolean;
   /** Skip image extraction when the caller needs text only. */
   textOnly?: boolean;
+  /**
+   * Whether the provider is server-managed (operator configuration). Carried
+   * from the routes by the document extraction boundary; a managed base URL
+   * may reach a local network without the ALLOW_LOCAL_NETWORKS opt-in under
+   * the strict parser transports.
+   */
+  managed?: boolean;
+  /**
+   * Whether the base URL was supplied by the request (unmanaged BYOK): such a
+   * URL runs under the strict public policy, and the MinerU Cloud API root
+   * also refuses redirects. Server callers set it; never request input.
+   */
+  callerSuppliedBaseUrl?: boolean;
 }
 
 // Note: ParsedPdfContent is imported from @/lib/types/pdf to avoid duplication

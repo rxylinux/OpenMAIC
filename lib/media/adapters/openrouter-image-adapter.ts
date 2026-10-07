@@ -23,6 +23,7 @@ import type {
   ImageGenerationOptions,
   ImageGenerationResult,
 } from '../types';
+import { mediaFetchFor } from '../media-fetch';
 import { requireModel } from '../require-model';
 
 export const OPENROUTER_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -79,10 +80,11 @@ export async function testOpenRouterImageConnectivity(
   config: ImageGenerationConfig,
 ): Promise<{ success: boolean; message: string }> {
   const baseUrl = openRouterBaseUrl(config.baseUrl);
+  const fetchImpl = mediaFetchFor(config);
 
   let response: Response;
   try {
-    response = await fetch(`${baseUrl}/key`, {
+    response = await fetchImpl(`${baseUrl}/key`, {
       method: 'GET',
       redirect: 'manual',
       headers: openRouterHeaders(config.apiKey),
@@ -101,7 +103,7 @@ export async function testOpenRouterImageConnectivity(
     };
   }
 
-  const text = await response.text().catch(() => '');
+  await response.body?.cancel().catch(() => undefined);
   if (response.status === 401 || response.status === 403) {
     return {
       success: false,
@@ -110,7 +112,7 @@ export async function testOpenRouterImageConnectivity(
   }
   return {
     success: false,
-    message: `OpenRouter image connectivity failed (${response.status}): ${text}`,
+    message: `OpenRouter image connectivity failed (${response.status})`,
   };
 }
 
@@ -119,13 +121,14 @@ export async function generateWithOpenRouterImage(
   options: ImageGenerationOptions,
 ): Promise<ImageGenerationResult> {
   const baseUrl = openRouterBaseUrl(config.baseUrl);
+  const fetchImpl = mediaFetchFor(config);
   const model = requireModel(config.model, 'OpenRouter Image');
 
   const body: Record<string, unknown> = { model, prompt: options.prompt, n: 1 };
   // `aspect_ratio` accepts our four ratios verbatim; omit it and the model decides.
   if (options.aspectRatio) body.aspect_ratio = options.aspectRatio;
 
-  const response = await fetch(`${baseUrl}/images`, {
+  const response = await fetchImpl(`${baseUrl}/images`, {
     method: 'POST',
     headers: openRouterHeaders(config.apiKey),
     // Never let a redirect carry the Authorization header to another host.

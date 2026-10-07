@@ -23,7 +23,25 @@ vi.mock('@/lib/server/usage-storage', () => ({
   recordGenerationUsage: mocks.recordGenerationUsage,
 }));
 vi.mock('node:fs', () => ({ promises: { mkdir: mocks.mkdir, writeFile: mocks.writeFile } }));
-vi.mock('@/lib/server/ssrf-guard', () => ({ validateUrlForSSRF: async () => null }));
+vi.mock('@/lib/server/provider-fetch', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/server/provider-fetch')>();
+  return {
+    ...actual,
+    // The external socket boundary for these tests: the pinned transport's
+    // policies and dispatcher selection stay real, the socket is the stubbed
+    // global fetch.
+    providerFetch: (input: string | URL, init?: RequestInit) => globalThis.fetch(input, init),
+  };
+});
+
+vi.mock('@/lib/server/ssrf-guard', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/server/ssrf-guard')>();
+  return {
+    ...actual,
+    validateUrlForSSRF: async () => null,
+    validateUrlForSSRFWithPolicy: async () => null,
+  };
+});
 vi.mock('@/lib/logger', () => ({ createLogger: () => mocks.log }));
 
 import {

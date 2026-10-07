@@ -47,6 +47,13 @@ vi.mock('@/lib/utils/database', () => ({
 
 const STAGE_ID = 'stage-chat';
 const LEARNER_KEY = 'anon:chat-test';
+/**
+ * The REAL ambient lock manager, captured at module load — before any test
+ * stubs `navigator`. Node 24 ships a genuine `navigator.locks`, so the
+ * real-lock controls at the bottom of this file execute against it instead
+ * of a fake (the suite default below pins the no-Web-Locks world).
+ */
+const ambientNavigator: Navigator | undefined = globalThis.navigator;
 
 interface LegacyChatStore {
   load(stageId: string): Promise<ChatSession[]>;
@@ -148,6 +155,18 @@ async function runtimeChatRecords(store: RuntimeStore): Promise<RuntimeRecord[]>
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // This suite's DEFAULT fixture is the no-Web-Locks world (fallback
+  // coordination + isolated generations): its record-count contracts,
+  // concurrent-tab read barriers, and fallback retirement expectations were
+  // all written for `withPartitionLocks`' isolated branch. Node 24 ships a
+  // real ambient navigator.locks which would silently flip every default
+  // test onto the shared-partition APPEND branch (different record counts)
+  // and DEADLOCK the concurrent-tab barriers (the real partition lock
+  // serializes the realms, so the second reader can never enter). Pin the
+  // intended environment explicitly; tests that exercise a lock manager
+  // already stub their own, and the real-lock controls at the bottom run
+  // against the captured ambient manager.
+  vi.stubGlobal('navigator', { locks: undefined });
 });
 
 afterEach(() => {
@@ -763,39 +782,50 @@ describe('chat RuntimeStore cutover', () => {
     vi.resetModules();
     const secondRealm = await import('@/lib/utils/chat-storage');
 
-    await Promise.all([
-      secondRealm.saveChatSessions(
+    // finally discipline: an assertion failure mid-race still releases the
+    // held reader barrier and drains both tabs' saves — a parked fallback
+    // writer must never leak into later tests.
+    let readersSettled = false;
+    let firstSave: Promise<void> | undefined;
+    let secondSave: Promise<void> | undefined;
+    try {
+      firstSave = secondRealm.saveChatSessions(
         STAGE_ID,
         [session({ title: 'First batch', messages: firstMessages, updatedAt: 5_000 })],
         { store: firstTab, learnerKey: LEARNER_KEY, legacyStore },
-      ),
-      saveChatSessions(
+      );
+      secondSave = saveChatSessions(
         STAGE_ID,
         [session({ title: 'Second batch', messages: secondMessages, updatedAt: 6_000 })],
         { store: secondTab, learnerKey: LEARNER_KEY, legacyStore },
-      ),
-    ]);
+      );
+      await Promise.all([firstSave, secondSave]);
+      readersSettled = true;
 
-    const runtimeSessions = (await firstBacking.listSessions(STAGE_ID, LEARNER_KEY)).filter(
-      (candidate) => candidate.kind === 'chat',
-    );
-    expect(runtimeSessions.length).toBeGreaterThan(0);
-    expect(runtimeSessions.every((candidate) => /:generation:\d+:[\w-]+$/.test(candidate.id))).toBe(
-      true,
-    );
-    const recordCounts = await Promise.all(
-      runtimeSessions.map(
-        async (candidate) => (await firstBacking.listRecords(candidate.id)).length,
-      ),
-    );
-    expect(Math.max(...recordCounts)).toBeLessThanOrEqual(256);
-    expect(
-      await loadChatSessions(STAGE_ID, {
-        store: firstBacking,
-        learnerKey: LEARNER_KEY,
-        legacyStore,
-      }),
-    ).toMatchObject([{ title: 'Second batch', updatedAt: 6_000 }]);
+      const runtimeSessions = (await firstBacking.listSessions(STAGE_ID, LEARNER_KEY)).filter(
+        (candidate) => candidate.kind === 'chat',
+      );
+      expect(runtimeSessions.length).toBeGreaterThan(0);
+      expect(
+        runtimeSessions.every((candidate) => /:generation:\d+:[\w-]+$/.test(candidate.id)),
+      ).toBe(true);
+      const recordCounts = await Promise.all(
+        runtimeSessions.map(
+          async (candidate) => (await firstBacking.listRecords(candidate.id)).length,
+        ),
+      );
+      expect(Math.max(...recordCounts)).toBeLessThanOrEqual(256);
+      expect(
+        await loadChatSessions(STAGE_ID, {
+          store: firstBacking,
+          learnerKey: LEARNER_KEY,
+          legacyStore,
+        }),
+      ).toMatchObject([{ title: 'Second batch', updatedAt: 6_000 }]);
+    } finally {
+      if (!readersSettled) releaseReaders();
+      await Promise.allSettled([firstSave, secondSave]);
+    }
   });
 
   it('retires superseded fallback snapshots when streamed content keeps the same timestamp', async () => {
@@ -876,18 +906,32 @@ describe('chat RuntimeStore cutover', () => {
     vi.resetModules();
     const secondRealm = await import('@/lib/utils/chat-storage');
 
-    await Promise.all([
-      saveChatSessions(STAGE_ID, [session({ title: 'First', updatedAt: 2_000 })], {
+    // finally discipline: release the held reader barrier and drain both
+    // tabs' saves on ANY exit (see the batch-race fixture above).
+    let readersSettled = false;
+    let firstSave: Promise<void> | undefined;
+    let secondSave: Promise<void> | undefined;
+    try {
+      firstSave = saveChatSessions(STAGE_ID, [session({ title: 'First', updatedAt: 2_000 })], {
         store: concurrentTab(firstBacking),
         learnerKey: LEARNER_KEY,
         legacyStore,
-      }),
-      secondRealm.saveChatSessions(STAGE_ID, [session({ title: 'Second', updatedAt: 2_000 })], {
-        store: concurrentTab(secondBacking),
-        learnerKey: LEARNER_KEY,
-        legacyStore,
-      }),
-    ]);
+      });
+      secondSave = secondRealm.saveChatSessions(
+        STAGE_ID,
+        [session({ title: 'Second', updatedAt: 2_000 })],
+        {
+          store: concurrentTab(secondBacking),
+          learnerKey: LEARNER_KEY,
+          legacyStore,
+        },
+      );
+      await Promise.all([firstSave, secondSave]);
+      readersSettled = true;
+    } finally {
+      if (!readersSettled) releaseReaders();
+      await Promise.allSettled([firstSave, secondSave]);
+    }
 
     const runtimeSessions = (await initialStore.listSessions(STAGE_ID, LEARNER_KEY)).filter(
       (candidate) => candidate.kind === 'chat',
@@ -2283,4 +2327,161 @@ describe('chat RuntimeStore cutover', () => {
       }),
     ).resolves.toEqual([{ ...fresh, status: 'interrupted', pendingToolCalls: [] }]);
   });
+});
+
+// --- real Web Locks branch (separately executed controls) --------------------
+// The suite default above pins the no-Web-Locks world; these controls run
+// against the REAL ambient navigator.locks (Node 24 provides one) and pin
+// the shared-partition APPEND branch's own contract. Both environments stay
+// honestly represented — the branches are different by design, not one
+// correct and one broken.
+
+describe('chat RuntimeStore cutover — real Web Locks branch', () => {
+  const hasAmbientLocks =
+    typeof ambientNavigator !== 'undefined' &&
+    typeof (ambientNavigator as { locks?: { request?: unknown } }).locks?.request === 'function';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Restore the GENUINE ambient lock manager for these controls only.
+    vi.stubGlobal('navigator', ambientNavigator);
+  });
+
+  it.skipIf(!hasAmbientLocks)(
+    'shared-partition APPEND semantics: an update appends a state record to the SAME session and the fold keeps the latest',
+    async () => {
+      const store = makeRuntimeStore();
+      const legacyStore = new MemoryLegacyChatStore();
+
+      await saveChatSessions(STAGE_ID, [session({ title: 'First' })], {
+        store,
+        learnerKey: LEARNER_KEY,
+        legacyStore,
+      });
+      const firstSessions = (await store.listSessions(STAGE_ID, LEARNER_KEY)).filter(
+        (candidate) => candidate.kind === 'chat',
+      );
+      const firstRecords = await store.listRecords(firstSessions[0]!.id);
+      expect(firstRecords.map((record) => (record.payload as { kind?: string }).kind)).toEqual([
+        'chat_message',
+        'chat_session_state',
+      ]);
+
+      // Under real partition locks the writer APPENDS into the same session
+      // (no isolated generation is minted): the new state rides alongside the
+      // old one and the fold picks the latest.
+      await saveChatSessions(STAGE_ID, [session({ title: 'Second', updatedAt: 1_300 })], {
+        store,
+        learnerKey: LEARNER_KEY,
+        legacyStore,
+      });
+      const secondSessions = (await store.listSessions(STAGE_ID, LEARNER_KEY)).filter(
+        (candidate) => candidate.kind === 'chat',
+      );
+      expect(secondSessions.map((candidate) => candidate.id)).toEqual(
+        firstSessions.map((candidate) => candidate.id),
+      );
+      const secondRecords = await store.listRecords(secondSessions[0]!.id);
+      expect(secondRecords).toHaveLength(firstRecords.length + 1); // appended state
+      expect(
+        (await loadChatSessions(STAGE_ID, { store, learnerKey: LEARNER_KEY, legacyStore }))[0]
+          .title,
+      ).toBe('Second'); // the fold keeps the LATEST state
+    },
+  );
+
+  it.skipIf(!hasAmbientLocks)(
+    'the real partition lock serializes same-realm writers: the second save issues NO store read until the first settles',
+    async () => {
+      const backing = makeRuntimeStore();
+      const legacyStore = new MemoryLegacyChatStore();
+      await saveChatSessions(STAGE_ID, [session({ title: 'Base' })], {
+        store: backing,
+        learnerKey: LEARNER_KEY,
+        legacyStore,
+      });
+
+      // Hold the FIRST save inside its appendRecord; count the second save's
+      // store reads. Under the real partition lock the second save's whole
+      // locked work (views included) waits — zero reads before the release.
+      let releaseAppend!: () => void;
+      const appendGate = new Promise<void>((resolve) => {
+        releaseAppend = resolve;
+      });
+      let appendArrived!: () => void;
+      const appendArrivedPromise = new Promise<void>((resolve) => {
+        appendArrived = resolve;
+      });
+      let gatedFirstAppend = true;
+      const gatedStore = new Proxy(backing, {
+        get(target, property) {
+          const value = Reflect.get(target, property, target) as unknown;
+          if (property === 'appendRecord') {
+            return async (...args: Parameters<RuntimeStore['appendRecord']>) => {
+              if (gatedFirstAppend) {
+                gatedFirstAppend = false;
+                appendArrived();
+                await appendGate;
+              }
+              return (value as (...a: unknown[]) => unknown).apply(target, args) as ReturnType<
+                RuntimeStore['appendRecord']
+              >;
+            };
+          }
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      let secondReads = 0;
+      const countingStore = new Proxy(backing, {
+        get(target, property) {
+          const value = Reflect.get(target, property, target) as unknown;
+          if (property === 'listSessions' || property === 'listRecords') {
+            return async (...args: unknown[]) => {
+              secondReads += 1;
+              return (value as (...a: unknown[]) => unknown).apply(target, args);
+            };
+          }
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+
+      let firstSave: Promise<void> | undefined;
+      let secondSave: Promise<void> | undefined;
+      let gateOpen = false;
+      try {
+        firstSave = saveChatSessions(STAGE_ID, [session({ title: 'First', updatedAt: 2_000 })], {
+          store: gatedStore,
+          learnerKey: LEARNER_KEY,
+          legacyStore,
+        });
+        await appendArrivedPromise;
+        secondSave = saveChatSessions(STAGE_ID, [session({ title: 'Second', updatedAt: 3_000 })], {
+          store: countingStore as unknown as RuntimeStore,
+          learnerKey: LEARNER_KEY,
+          legacyStore,
+        });
+        // Bounded observation window: the real lock must hold the second
+        // save's entire locked work (its first store read) back.
+        await new Promise((resolve) => {
+          setTimeout(resolve, 150);
+        });
+        expect(secondReads).toBe(0); // serialization, not interleaving
+      } finally {
+        gateOpen = true;
+        releaseAppend();
+        await Promise.allSettled([firstSave, secondSave]);
+        void gateOpen;
+      }
+
+      expect(
+        (
+          await loadChatSessions(STAGE_ID, {
+            store: backing,
+            learnerKey: LEARNER_KEY,
+            legacyStore,
+          })
+        )[0].title,
+      ).toBe('Second'); // both writers committed in order; the fold sees the last
+    },
+  );
 });

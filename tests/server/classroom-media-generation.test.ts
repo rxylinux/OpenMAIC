@@ -6,6 +6,30 @@ import type { SceneOutline } from '@/lib/types/generation';
 // The media pipeline writes generated files to disk; intercept the writes so
 // the test never touches the worktree. Everything else (including the YAML
 // provider-config read) delegates to the real fs.
+vi.mock('@/lib/server/provider-fetch', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/server/provider-fetch')>();
+  return {
+    ...actual,
+    // Socket boundary: the pinned managed transport stays real, the socket is
+    // the stubbed global fetch.
+    providerFetch: (input: string | URL, init?: RequestInit) => globalThis.fetch(input, init),
+  };
+});
+
+// The strict public guard resolves the provider-returned download hostname;
+// pin the URL-layer answers publicly so only the socket is stubbed.
+vi.mock('node:dns', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:dns')>();
+  return {
+    ...actual,
+    lookup: vi.fn(),
+    promises: {
+      ...actual.promises,
+      lookup: vi.fn().mockResolvedValue([{ address: '93.184.216.34', family: 4 }]),
+    },
+  };
+});
+
 vi.mock('fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('fs')>();
   return {

@@ -105,6 +105,7 @@ export interface UserRequirements {
   webSearch?: boolean; // Enable web search for richer context
   interactiveMode?: boolean; // Enable Interactive Mode for interactive-first generation
   taskEngineMode?: boolean; // Enable vocational task-engine generation path
+  difficultyPreference?: 'easy' | 'medium' | 'hard'; // Explicit quiz difficulty preference; unset lets the model infer it
 }
 
 // ==================== Stage 1 Output: Scene Outlines (Simplified) ====================

@@ -7,6 +7,7 @@ import { useI18n } from '@/lib/hooks/use-i18n';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { AddQuestionMenu } from './AddQuestionMenu';
 import { QuestionCard } from './QuestionCard';
+import { QuizRegenerateControl } from './QuizRegenerateControl';
 import {
   reorderQuizQuestions,
   useQuizSurfaceLifecycle,
@@ -63,6 +64,7 @@ export function QuizForm() {
         // The normal 5rem breathing room remains when there are no hints.
         style={{ paddingBottom: 'calc(var(--editor-hint-rail-height, 0px) + 5rem)' }}
       >
+        <QuizRegenerateControl />
         {questions.length === 0 ? (
           <EmptyState />
         ) : (

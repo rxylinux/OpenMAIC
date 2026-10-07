@@ -20,7 +20,8 @@ import {
 } from '@/lib/server/provider-config';
 import { createLogger } from '@/lib/logger';
 import { recordGenerationUsage } from '@/lib/server/usage-storage';
-import { validateUrlForSSRF } from '@/lib/server/ssrf-guard';
+import { managedMediaProviderFetch } from '@/lib/server/media-provider-fetch';
+import { fetchProviderResultUrl } from '@/lib/server/provider-result-fetch';
 import {
   DownloadByteBudget,
   MAX_REMOTE_IMAGE_BATCH_BYTES,
@@ -157,26 +158,6 @@ async function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Pro
   });
 }
 
-/** SSRF-guarded, redirect-following fetch for a provider's video or poster. */
-async function fetchGeneratedMedia(url: string, signal: AbortSignal): Promise<Response> {
-  const maxRedirects = 5;
-  let currentUrl = url;
-  for (let hop = 0; ; hop++) {
-    throwIfAborted(signal);
-    const ssrfError = await validateUrlForSSRF(currentUrl);
-    throwIfAborted(signal);
-    if (ssrfError) throw new Error(ssrfError);
-
-    const response = await fetch(currentUrl, { redirect: 'manual', signal });
-    if (response.status < 300 || response.status >= 400) return response;
-
-    const location = response.headers.get('location');
-    if (!location) throw new Error('Video download redirect has no Location header');
-    if (hop >= maxRedirects) throw new Error('Video download exceeded 5 redirects');
-    currentUrl = new URL(location, currentUrl).href;
-  }
-}
-
 /**
  * Download the provider's poster and store it, or give up on it.
  *
@@ -192,7 +173,10 @@ async function storeGeneratedPoster(
   assetStore?: AssetStore,
 ): Promise<string | undefined> {
   try {
-    const response = await fetchGeneratedMedia(posterUrl, signal);
+    const response = await fetchProviderResultUrl(posterUrl, {
+      signal,
+      maxBytes: MAX_REMOTE_IMAGE_BYTES,
+    });
     if (!response.ok) throw new Error(`Generated poster download failed: HTTP ${response.status}`);
     const mime = response.headers.get('content-type')?.split(';')[0]?.trim() || 'image/jpeg';
     if (!mime.startsWith('image/')) {
@@ -246,11 +230,16 @@ export async function defaultPersistGeneratedVideo(
   } catch {
     throw new Error('Video provider returned an invalid URL');
   }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+  // `data:` is decoded locally; a network URL must be HTTPS (enforced by the
+  // download helper under the strict public policy).
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && parsed.protocol !== 'data:') {
     throw new Error(`Video provider returned an unsupported URL protocol: ${parsed.protocol}`);
   }
 
-  const response = await fetchGeneratedMedia(result.url, signal);
+  const response = await fetchProviderResultUrl(result.url, {
+    signal,
+    maxBytes: MAX_GENERATED_VIDEO_BYTES,
+  });
   if (!response.ok) throw new Error(`Generated video download failed: HTTP ${response.status}`);
   const mime = response.headers.get('content-type')?.split(';')[0]?.trim() || 'video/mp4';
   if (!mime.startsWith('video/')) {
@@ -296,6 +285,9 @@ function defaultResolveVideoProviderConfig(providerId: VideoProviderId): VideoGe
     apiKey: resolveVideoApiKey(providerId),
     baseUrl: resolveVideoBaseUrl(providerId),
     model: resolveVideoModel(providerId),
+    // The agent runtime resolves providers purely from server config, so the
+    // pinned managed transport applies (operator endpoints may be local).
+    fetchImpl: managedMediaProviderFetch,
   };
 }
 

@@ -10,6 +10,8 @@ Please generate scene outlines based on the following course requirements.
 
 {{userProfile}}
 
+{{difficultyPreference}}
+
 ## Language Context
 
 Infer the course language directive by applying the decision rules from the system prompt. Key reminders:
@@ -55,11 +57,13 @@ Then output your response as a single JSON object.
 {
   "languageDirective": "2-5 sentence instruction describing the course language behavior",
   "courseTitle": "concise course name, ≤30 chars, in the teaching language",
+  "subject": "\"chinese\" | \"math\" | \"english\" | \"science\" | \"other\"",
+  "gradeSemester": "\"grade-1-up\" … \"grade-6-down\" or \"other\"",
   "outlines": [ /* array of scene objects, schema described below */ ]
 }
 ```
 
-Never return a bare array. Never omit `languageDirective` or `courseTitle`. All three keys are required.
+Never return a bare array. Never omit `languageDirective`, `courseTitle`, `subject`, or `gradeSemester`. All five keys are required — `subject` and `gradeSemester` must each be exactly one code from the closed lists above.
 
 **Each scene inside the `outlines` array has this minimum shape:**
 
@@ -84,6 +88,7 @@ Never return a bare array. Never omit `languageDirective` or `courseTitle`. All 
      "questionTypes": ["single", "multiple"]
    }
    ```
+   If a Difficulty Preference section is present above, every `quizConfig.difficulty` MUST equal that selected value instead of being inferred.
 {{#if hasSourceImages}}
 - **If source images are available**, add `suggestedImageIds` to relevant slide scenes. Only use image IDs listed under Available Images.
 {{/if}}
@@ -95,4 +100,4 @@ Never return a bare array. Never omit `languageDirective` or `courseTitle`. All 
 - **Language**: Infer from the user's requirement text and context, then output all content in the inferred language
 - **If web search results are provided**, reference specific findings and sources in scene descriptions and keyPoints. The search results provide up-to-date information — incorporate it to make the course content current and accurate.
 
-**Final reminder**: your entire response must be a JSON **object** with exactly three top-level keys — `languageDirective` (string), `courseTitle` (string, ≤30 chars, in the teaching language), and `outlines` (array). Do not return a bare array. Do not wrap in prose or code fences.
+**Final reminder**: your entire response must be a JSON **object** with exactly five top-level keys — `languageDirective` (string), `courseTitle` (string, ≤30 chars, in the teaching language), `subject` (one code from the closed list `"chinese"` / `"math"` / `"english"` / `"science"` / `"other"`), `gradeSemester` (one code from the closed list `"grade-1-up"` … `"grade-6-down"` or `"other"`), and `outlines` (array). Do not return a bare array. Do not wrap in prose or code fences.

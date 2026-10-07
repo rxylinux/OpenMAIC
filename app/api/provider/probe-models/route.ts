@@ -1,10 +1,15 @@
 import { NextRequest } from 'next/server';
 import { createLogger } from '@/lib/logger';
 import { apiError, apiSuccess } from '@/lib/server/api-response';
-import { validateUrlForSSRF } from '@/lib/server/ssrf-guard';
+import { validatePublicUrlForSSRF } from '@/lib/server/ssrf-guard';
 import { fetchModels, ModelFetchError } from '@/lib/server/model-fetch';
+import { isRejectedRedirectError } from '@/lib/server/provider-fetch';
 
 const log = createLogger('ProbeModels');
+
+// Fixed messages: the provider's body, status text and transport errors are
+// logged server-side only and never echoed back to the caller.
+const CONNECTION_FAILED_MESSAGE = 'Cannot connect to the provider, please check the Base URL';
 
 /** Model ids that are not chat models — filtered out of probe results. */
 const NON_CHAT_PATTERN = /(tts|asr|whisper|embedding|rerank|mineru|image|video|voxcpm|moderation)/i;
@@ -29,9 +34,11 @@ export async function POST(req: NextRequest) {
       return apiError('MISSING_REQUIRED_FIELD', 400, 'baseUrl is required');
     }
 
-    // SSRF guard on both the base URL and an explicit models URL override.
+    // Both the base URL and an explicit models URL override are caller input:
+    // the strict public policy applies (the operator's ALLOW_LOCAL_NETWORKS
+    // opt-in is not inherited by request URLs).
     for (const url of [baseUrl, modelsUrl].filter(Boolean) as string[]) {
-      const ssrfError = await validateUrlForSSRF(url);
+      const ssrfError = await validatePublicUrlForSSRF(url);
       if (ssrfError) return apiError('INVALID_REQUEST', 400, ssrfError);
     }
 
@@ -55,13 +62,15 @@ export async function POST(req: NextRequest) {
         // No /models endpoint — signal the UI (via 404) to use manual model entry.
         return apiError('INVALID_REQUEST', 404, 'This provider does not expose a model list');
       }
-      return apiError('INTERNAL_ERROR', 502, error.message);
+      log.warn(`Model probe failed [status=${error.status}]: ${error.message}`);
+      return apiError('UPSTREAM_ERROR', 502, `The provider answered HTTP ${error.status}`);
+    }
+    if (isRejectedRedirectError(error)) {
+      return apiError('REDIRECT_NOT_ALLOWED', 403, 'Redirects are not allowed');
     }
     log.error('Model probe failed:', error);
-    return apiError(
-      'INTERNAL_ERROR',
-      500,
-      error instanceof Error ? error.message : 'Failed to probe models',
-    );
+    // Refused, unresolvable, timed-out and policy-blocked targets all get the
+    // same answer so the probe cannot be used to map internal services.
+    return apiError('UPSTREAM_ERROR', 502, CONNECTION_FAILED_MESSAGE);
   }
 }

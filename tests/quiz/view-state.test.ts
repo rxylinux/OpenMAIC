@@ -70,6 +70,7 @@ describe('quiz view runtime hydration', () => {
         recordPhase: async (input) => {
           calls.push(input);
           await persisted;
+          return { sessionId: 'attempt-1', createdSession: false };
         },
       },
     );
@@ -107,6 +108,7 @@ describe('quiz view runtime hydration', () => {
       recordPhase: async (input: unknown) => {
         calls.push(input);
         await persisted;
+        return { sessionId: 'attempt-1', createdSession: false };
       },
     };
     const base = {

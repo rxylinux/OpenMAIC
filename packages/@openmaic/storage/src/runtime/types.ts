@@ -72,6 +72,26 @@ export interface RuntimeTailOptions {
   expectedLastSeq?: number | null;
 }
 
+/**
+ * Options of {@link RuntimeStore.setSessionStatusIfLatest}: the tail guard
+ * plus the RELEVANCE anchor of the lineage precondition.
+ */
+export interface RuntimeStatusIfLatestOptions extends RuntimeTailOptions {
+  /**
+   * When provided, a strictly newer same-kind sibling blocks the write ONLY
+   * when the canonical quiz reader would ADOPT it over the target: the
+   * sibling's envelope must survive the same migrate+validate gate
+   * `listSessions` applies (corrupt envelopes are omitted, never blockers),
+   * and the sibling's LATEST record anchored to this scene — never "any
+   * anchored record" — must be a valid quiz payload (payloadVersion 1, a
+   * real quiz phase, a plain answers record). Newer empty sessions,
+   * malformed-payload tails (even over a valid older draft), and quizzes of
+   * OTHER scenes never block a legitimate repair. When omitted, ANY strictly
+   * newer same-kind sibling blocks (the conservative generic form).
+   */
+  relevantSceneId?: string;
+}
+
 /** Optional parent-session mutation committed with one appended record. */
 export interface RuntimeAppendOptions extends RuntimeTailOptions {
   sessionTransition?: {
@@ -138,6 +158,28 @@ export interface RuntimeStore {
     updatedAt: string,
     options?: RuntimeTailOptions,
   ): Promise<void>;
+
+  /**
+   * Status write whose lineage precondition is validated ATOMICALLY with the
+   * write transaction: the write commits only when no RELEVANT strictly-newer
+   * same-kind sibling exists in the `(stageId, learnerKey)` partition (see
+   * `RuntimeStatusIfLatestOptions.relevantSceneId`; ordering by the createdAt
+   * instant, tie-breaking on id — the `listSessions` order). Returns `true`
+   * when the status write committed; `false` when a relevant newer sibling
+   * exists — in that case NOTHING was written (an obsolete session is never
+   * mutated). The `expectedLastSeq` tail guard keeps its `setSessionStatus`
+   * semantics, including its version-validation behavior.
+   *
+   * This is the atomic "obsolete repair must not reopen the old root"
+   * boundary: a read-then-write race across two transactions cannot
+   * reactivate a lineage that a concurrent writer already advanced.
+   */
+  setSessionStatusIfLatest?(
+    sessionId: string,
+    status: RuntimeSessionStatus,
+    updatedAt: string,
+    options?: RuntimeStatusIfLatestOptions,
+  ): Promise<boolean>;
 
   /** Delete one session and all its records. Idempotent. */
   deleteSession(sessionId: string): Promise<void>;

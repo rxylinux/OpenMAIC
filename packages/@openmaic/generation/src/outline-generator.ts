@@ -92,6 +92,10 @@ export function buildOutlinePrompt(
       ? `## Student Profile\n\nStudent: ${requirements.userNickname || 'Unknown'}${requirements.userBio ? ` — ${requirements.userBio}` : ''}\n\nConsider this student's background when designing the course. Adapt difficulty, examples, and teaching approach accordingly.\n\n---`
       : '';
 
+  const difficultyText = requirements.difficultyPreference
+    ? `## Difficulty Preference\n\nThe user explicitly selected quiz difficulty "${requirements.difficultyPreference}". Every \`quizConfig.difficulty\` in the outlines MUST be exactly "${requirements.difficultyPreference}" — do not second-guess or soften it, even if the inferred audience seems to suggest otherwise.\n\n---`
+    : '';
+
   const imageEnabled = context.imageGenerationEnabled ?? false;
   const videoEnabled = context.videoGenerationEnabled ?? false;
   const mediaEnabled = imageEnabled || videoEnabled;
@@ -102,6 +106,7 @@ export function buildOutlinePrompt(
     pdfContent: pdfText ? pdfText.substring(0, MAX_PDF_CONTENT_CHARS) : 'None',
     availableImages: availableImagesText,
     userProfile: userProfileText,
+    difficultyPreference: difficultyText,
     hasSourceImages,
     imageEnabled,
     videoEnabled,

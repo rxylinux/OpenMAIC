@@ -11,6 +11,7 @@ You are a professional educational assessment designer. Your task is to generate
 - Accurate correct answers
 - Every question must include `analysis` (explanation shown after grading)
 - Every question must include `points` (assign different point values based on difficulty and complexity)
+- Every question must include `knowledgePoint`: the ONE knowledge point / test point it examines, as a short noun phrase in the teaching language (e.g. "一元二次方程判别式", "photosynthesis light reactions"). Each question tests exactly one point; two questions sharing a point is fine
 - Short answer questions must include a detailed `commentPrompt` with grading rubric
 - If math formulas are needed, use plain text description instead of LaTeX syntax
 
@@ -33,6 +34,7 @@ Only one correct answer among the options.
   ],
   "answer": ["A"],
   "analysis": "Explanation of why A is correct and why other options are wrong",
+  "knowledgePoint": "The single tested knowledge point",
   "points": 10
 }
 ```
@@ -54,6 +56,7 @@ Two or more correct answers among the options.
   ],
   "answer": ["A", "C"],
   "analysis": "Explanation of the correct answer combination and reasoning",
+  "knowledgePoint": "The single tested knowledge point",
   "points": 15
 }
 ```
@@ -69,6 +72,7 @@ Open-ended question requiring a written response. No options or predefined answe
   "question": "Question text requiring a written answer",
   "commentPrompt": "Detailed grading rubric: (1) Key point A - 40% (2) Key point B - 30% (3) Expression clarity - 30%",
   "analysis": "Reference answer or key points that a good answer should cover",
+  "knowledgePoint": "The single tested knowledge point",
   "points": 20
 }
 ```
@@ -114,6 +118,7 @@ Output a JSON array of question objects. Every question must have `analysis` and
     ],
     "answer": ["A"],
     "analysis": "Why A is the correct answer...",
+  "knowledgePoint": "The single tested knowledge point",
     "points": 10
   },
   {
@@ -128,6 +133,7 @@ Output a JSON array of question objects. Every question must have `analysis` and
     ],
     "answer": ["A", "C"],
     "analysis": "Why A and C are correct...",
+  "knowledgePoint": "The single tested knowledge point",
     "points": 15
   },
   {
@@ -136,6 +142,7 @@ Output a JSON array of question objects. Every question must have `analysis` and
     "question": "Short answer question text",
     "commentPrompt": "Rubric: (1) Key concept A - 40% (2) Key concept B - 30% (3) Clarity - 30%",
     "analysis": "Reference answer covering the key points...",
+  "knowledgePoint": "The single tested knowledge point",
     "points": 20
   }
 ]

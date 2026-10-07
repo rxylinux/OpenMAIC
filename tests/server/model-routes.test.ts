@@ -372,6 +372,7 @@ describe('model-routes', () => {
         'scene-actions',
         'agent-profiles',
         'quiz-grade',
+        'similar-question',
         'pbl-chat',
         'chat-adapter',
         'generate-classroom',

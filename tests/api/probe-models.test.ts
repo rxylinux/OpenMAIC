@@ -1,143 +1,140 @@
-import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+/**
+ * `/api/provider/probe-models` — strict-public caller contract, real transport.
+ *
+ * Model discovery URLs are explicit request input, so no operator opt-in is
+ * set anywhere in this file: private/literal/metadata/rebinding targets must
+ * be refused by the real guard or the real pinned dispatcher with no socket
+ * reaching a loopback answer. Positive and redirect contracts run in
+ * `probe-models-caller-transport.test.ts` with the socket boundary mocked.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NextRequest } from 'next/server';
 
-const mocks = vi.hoisted(() => ({ validateUrlForSSRF: vi.fn() }));
+import { POST } from '@/app/api/provider/probe-models/route';
+import { destroyAudioProviderDispatchersForTests } from '@/lib/server/provider-fetch';
+import {
+  answerWith,
+  closeLoopbackServers,
+  LOOPBACK_ANSWER,
+  PUBLIC_ANSWER,
+  startLoopback,
+} from '@/tests/helpers/loopback-servers';
 
-vi.mock('@/lib/server/ssrf-guard', () => ({
-  validateUrlForSSRF: mocks.validateUrlForSSRF,
+const mocks = vi.hoisted(() => ({
+  promisesLookup: vi.fn(),
+  callbackLookup: vi.fn(),
 }));
 
+vi.mock('node:dns', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:dns')>();
+  return {
+    ...actual,
+    lookup: (...args: unknown[]) => mocks.callbackLookup(...args),
+    promises: { ...actual.promises, lookup: mocks.promisesLookup },
+  };
+});
+
 vi.mock('@/lib/logger', () => ({
-  createLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
+  createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
 }));
 
 async function postProbeModels(body: Record<string, unknown>) {
-  const { POST } = await import('@/app/api/provider/probe-models/route');
   const request = new Request('http://localhost/api/provider/probe-models', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  return POST(request as unknown as NextRequest);
+  const res = await POST(request as unknown as NextRequest);
+  return { status: res.status, json: await res.json() };
 }
 
-describe('POST /api/provider/probe-models', () => {
+const originalAllowLocal = process.env.ALLOW_LOCAL_NETWORKS;
+const globalFetch = vi.fn();
+
+describe('POST /api/provider/probe-models (caller URLs: strict public)', () => {
   beforeEach(() => {
-    vi.resetModules();
-    mocks.validateUrlForSSRF.mockReset();
-    mocks.validateUrlForSSRF.mockResolvedValue(null);
+    mocks.promisesLookup.mockReset();
+    mocks.callbackLookup.mockReset();
+    destroyAudioProviderDispatchersForTests();
+    delete process.env.ALLOW_LOCAL_NETWORKS;
+    mocks.promisesLookup.mockResolvedValue(PUBLIC_ANSWER);
+    mocks.callbackLookup.mockImplementation(answerWith(LOOPBACK_ANSWER));
+    globalFetch.mockReset();
+    globalFetch.mockRejectedValue(new Error('global fetch must not be used'));
+    vi.stubGlobal('fetch', globalFetch);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    expect(globalFetch).not.toHaveBeenCalled();
     vi.unstubAllGlobals();
+    destroyAudioProviderDispatchersForTests();
+    if (originalAllowLocal === undefined) delete process.env.ALLOW_LOCAL_NETWORKS;
+    else process.env.ALLOW_LOCAL_NETWORKS = originalAllowLocal;
+    await closeLoopbackServers();
   });
 
-  it('maps an upstream redirect to the exact redirect-not-allowed contract without reading it', async () => {
-    const text = vi.fn().mockResolvedValue('redirect response body');
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: false,
-      status: 302,
-      text,
-    } as unknown as Response);
-    vi.stubGlobal('fetch', fetchMock);
+  it('refuses a private base URL even with the operator opt-in set', async () => {
+    process.env.ALLOW_LOCAL_NETWORKS = 'true';
 
     const res = await postProbeModels({
-      baseUrl: 'https://api.example.com',
+      baseUrl: 'http://192.168.1.10',
       apiKey: 'test-key',
     });
-    const json = await res.json();
 
-    expect(res.status).toBe(403);
-    expect(json).toEqual({
-      success: false,
-      errorCode: 'REDIRECT_NOT_ALLOWED',
-      error: 'Redirects are not allowed',
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(text).not.toHaveBeenCalled();
-  });
-
-  it('preserves successful model filtering and response metadata', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            data: [
-              { id: 'chat-model', owned_by: 'provider' },
-              { id: 'text-embedding-3-small', owned_by: 'provider' },
-            ],
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
-        ),
-      ),
-    );
-
-    const res = await postProbeModels({
-      baseUrl: 'https://api.example.com',
-      apiKey: 'test-key',
-    });
-    const json = await res.json();
-
-    expect(res.status).toBe(200);
-    expect(json).toEqual({
-      success: true,
-      models: [{ id: 'chat-model', ownedBy: 'provider' }],
-      total: 2,
-      filtered: 1,
-    });
-  });
-
-  it.each([401, 403])('preserves the API-key error contract for upstream %i', async (status) => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue({
-        ok: false,
-        status,
-        text: vi.fn().mockResolvedValue('invalid key'),
-      } as unknown as Response),
-    );
-
-    const res = await postProbeModels({
-      baseUrl: 'https://api.example.com',
-      apiKey: 'bad-key',
-    });
-    const json = await res.json();
-
-    expect(res.status).toBe(401);
-    expect(json).toEqual({
+    expect(res.status).toBe(400);
+    expect(res.json).toEqual({
       success: false,
       errorCode: 'INVALID_REQUEST',
-      error: 'API key is invalid or expired',
+      error: expect.stringContaining('Local/private network URLs are not allowed'),
     });
   });
 
-  it('preserves the manual-entry response when no model endpoint exists', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue({
-        ok: false,
-        status: 404,
-        text: vi.fn(),
-      } as unknown as Response),
-    );
+  it('refuses a loopback base URL even with the operator opt-in set', async () => {
+    process.env.ALLOW_LOCAL_NETWORKS = 'true';
+    const loopback = await startLoopback();
+
+    const res = await postProbeModels({ baseUrl: loopback.origin, apiKey: 'key' });
+
+    expect(res.status).toBe(400);
+    expect(loopback.requests()).toBe(0);
+  });
+
+  it('refuses a literal metadata target under every policy', async () => {
+    process.env.ALLOW_LOCAL_NETWORKS = 'true';
 
     const res = await postProbeModels({
-      baseUrl: 'https://api.example.com',
+      baseUrl: 'http://169.254.169.254/latest',
       apiKey: 'test-key',
     });
-    const json = await res.json();
 
-    expect(res.status).toBe(404);
-    expect(json).toEqual({
+    expect(res.status).toBe(400);
+    expect(res.json).toEqual({
       success: false,
       errorCode: 'INVALID_REQUEST',
-      error: 'This provider does not expose a model list',
+      error: expect.stringContaining('Cloud instance metadata endpoints are never allowed'),
     });
+  });
+
+  it('refuses a rebinding hostname before any socket reaches the loopback answer', async () => {
+    const internal = await startLoopback();
+    mocks.callbackLookup.mockImplementation(answerWith(LOOPBACK_ANSWER));
+
+    const res = await postProbeModels({
+      baseUrl: 'https://rebinding.example.test',
+      apiKey: 'test-key',
+    });
+
+    expect(res.status).toBe(502);
+    expect(res.json).toEqual({
+      success: false,
+      errorCode: 'UPSTREAM_ERROR',
+      error: 'Cannot connect to the provider, please check the Base URL',
+    });
+    expect(internal.requests()).toBe(0);
+  });
+
+  it('requires a baseUrl', async () => {
+    const res = await postProbeModels({ apiKey: 'key' });
+    expect(res.status).toBe(400);
   });
 });

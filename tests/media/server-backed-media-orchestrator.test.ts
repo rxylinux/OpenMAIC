@@ -1358,6 +1358,10 @@ describe('server-backed classic media orchestrator', () => {
     const commitInFlight = new Promise<void>((resolve) => {
       releaseCommit = resolve;
     });
+    let overlapLaunchedResolve!: () => void;
+    const overlapLaunched = new Promise<void>((resolve) => {
+      overlapLaunchedResolve = resolve;
+    });
     let overlapping: Promise<void> | undefined;
     let callsWhenOverlappingStarted = 0;
     // The retry path re-enters generation while the first pass is mid-commit.
@@ -1368,21 +1372,37 @@ describe('server-backed classic media orchestrator', () => {
         // call returns.
         callsWhenOverlappingStarted = providerCallCount();
         overlapping = generateMediaForOutlines(outlines, stageId);
+        // The overlap point is reached — event synchronization, never a
+        // microtask-count budget (which can expire mid-provider on this
+        // runtime and compare against a capture that has not happened yet).
+        overlapLaunchedResolve();
         await commitInFlight;
       }
       return 'ast_generated';
     });
 
-    const first = generateMediaForOutlines(outlines, stageId);
-    // Give the second pass every chance to run: if it were not waiting, its
-    // collection loop is synchronous and element two is only `pending`, so it
-    // would have called the provider by now.
-    for (let tick = 0; tick < 50; tick += 1) await Promise.resolve();
-    expect(providerCallCount()).toBe(callsWhenOverlappingStarted);
+    // finally discipline: a mid-race assertion failure still opens the
+    // commit gate and drains BOTH passes — a parked pass (or its per-course
+    // serialization slot) must never leak into later tests.
+    let gateOpen = false;
+    let first: Promise<void> | undefined;
+    try {
+      first = generateMediaForOutlines(outlines, stageId);
+      await overlapLaunched; // pass1 is provably mid-commit; pass2 is queued
+      // Give the second pass every chance to run: if it were not waiting, its
+      // collection loop is synchronous and element two is only `pending`, so it
+      // would have called the provider by now.
+      for (let tick = 0; tick < 50; tick += 1) await Promise.resolve();
+      expect(providerCallCount()).toBe(callsWhenOverlappingStarted);
 
-    releaseCommit?.();
-    await first;
-    await overlapping;
+      gateOpen = true;
+      releaseCommit?.();
+      await first;
+      await overlapping!;
+    } finally {
+      if (!gateOpen) releaseCommit?.();
+      await Promise.allSettled([first, overlapping ?? Promise.resolve()]);
+    }
   });
 
   // The handoff the retry path actually performs: abort the live pass and start
@@ -1407,12 +1427,20 @@ describe('server-backed classic media orchestrator', () => {
     const firstInFlight = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
+    let firstCallStartedResolve!: () => void;
+    const firstCallStarted = new Promise<void>((resolve) => {
+      firstCallStartedResolve = resolve;
+    });
     let calls = 0;
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === '/api/generate/image') {
         calls += 1;
         if (calls === 1) {
+          // Event synchronization: the abort below fires only once element
+          // one's provider call is genuinely the live one (two microtask
+          // ticks cannot prove the pass even started).
+          firstCallStartedResolve();
           await firstInFlight;
           throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
         }
@@ -1427,24 +1455,34 @@ describe('server-backed classic media orchestrator', () => {
       throw new Error(`Unexpected fetch: ${url}`);
     });
 
-    const first = new AbortController();
-    const pass1 = generateMediaForOutlines(outlines, stageId, first.signal).catch(() => undefined);
-    await Promise.resolve();
-    await Promise.resolve();
+    // finally discipline: open the in-flight gate and drain both passes on
+    // ANY exit (see the overlap fixture above).
+    let gateOpen = false;
+    let pass1: Promise<void> | undefined;
+    let pass2: Promise<void> | undefined;
+    try {
+      const first = new AbortController();
+      pass1 = generateMediaForOutlines(outlines, stageId, first.signal).catch(() => undefined);
+      await firstCallStarted; // element one's provider call is the LIVE one now
 
-    // Verbatim what the retry path does, in one synchronous block.
-    first.abort();
-    const second = new AbortController();
-    const pass2 = generateMediaForOutlines(outlines, stageId, second.signal).catch(() => undefined);
+      // Verbatim what the retry path does, in one synchronous block.
+      first.abort();
+      const second = new AbortController();
+      pass2 = generateMediaForOutlines(outlines, stageId, second.signal).catch(() => undefined);
 
-    releaseFirst?.();
-    await pass1;
-    await pass2;
+      gateOpen = true;
+      releaseFirst?.();
+      await pass1;
+      await pass2;
 
-    // The replacement waited for the aborted pass to settle, then took the two
-    // elements it never reached. The one whose call was actually cancelled is
-    // failed and retryable — an affordance, not a strand — and nothing is left
-    // waiting on a pass that no longer exists.
+      // The replacement waited for the aborted pass to settle, then took the two
+      // elements it never reached. The one whose call was actually cancelled is
+      // failed and retryable — an affordance, not a strand — and nothing is left
+      // waiting on a pass that no longer exists.
+    } finally {
+      if (!gateOpen) releaseFirst?.();
+      await Promise.allSettled([pass1, pass2]);
+    }
     expect(mocks.putAsset).toHaveBeenCalledTimes(2);
     const tasks = useMediaGenerationStore.getState().tasks;
     expect(Object.values(tasks).some((task) => task.status === 'pending')).toBe(false);

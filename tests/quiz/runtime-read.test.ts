@@ -752,7 +752,7 @@ describe('quiz runtime authoritative reads', () => {
         return typeof value === 'function' ? value.bind(target) : value;
       },
     }) as RuntimeStore;
-    let writing: Promise<void> | undefined;
+    let writing: Promise<unknown> | undefined;
     let triggered = false;
     const readerStore = new Proxy(readerBacking, {
       get(target, property) {

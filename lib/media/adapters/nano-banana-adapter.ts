@@ -19,6 +19,7 @@ import type {
   ImageGenerationOptions,
   ImageGenerationResult,
 } from '../types';
+import { mediaFetchFor } from '../media-fetch';
 import { requireModel } from '../require-model';
 
 const DEFAULT_MODEL = 'gemini-2.5-flash-image';
@@ -54,12 +55,13 @@ export async function testNanoBananaConnectivity(
 ): Promise<{ success: boolean; message: string }> {
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
   const model = config.model || DEFAULT_MODEL;
+  const fetchImpl = mediaFetchFor(config);
   const url = `${baseUrl}/v1beta/models`;
 
   // Try ?key= query param first (direct Google API), fall back to x-goog-api-key header (proxy)
   let response: Response | null = null;
   try {
-    response = await fetch(`${url}?key=${config.apiKey}`, {
+    response = await fetchImpl(`${url}?key=${config.apiKey}`, {
       method: 'GET',
       redirect: 'manual',
     });
@@ -68,7 +70,7 @@ export async function testNanoBananaConnectivity(
   }
   if (!response || !response.ok) {
     try {
-      response = await fetch(url, {
+      response = await fetchImpl(url, {
         method: 'GET',
         redirect: 'manual',
         headers: { 'x-goog-api-key': config.apiKey },
@@ -76,7 +78,7 @@ export async function testNanoBananaConnectivity(
     } catch (_err) {
       return {
         success: false,
-        message: `Network error: unable to reach ${baseUrl}. Check your Base URL and network connection.`,
+        message: `Network error: unable to reach the provider. Check your Base URL and network connection.`,
       };
     }
   }
@@ -85,8 +87,8 @@ export async function testNanoBananaConnectivity(
     return { success: true, message: `Connected to Nano Banana (${model})` };
   }
 
-  // Parse error body for user-friendly message
-  const text = await response.text().catch(() => '');
+  // Fixed text only: the provider's body never reaches the caller.
+  await response.body?.cancel().catch(() => undefined);
   if (response.status === 400 || response.status === 401 || response.status === 403) {
     return {
       success: false,
@@ -95,7 +97,7 @@ export async function testNanoBananaConnectivity(
   }
   return {
     success: false,
-    message: `Nano Banana connectivity failed (${response.status}): ${text}`,
+    message: `Nano Banana connectivity failed (${response.status})`,
   };
 }
 
@@ -104,9 +106,10 @@ export async function generateWithNanoBanana(
   options: ImageGenerationOptions,
 ): Promise<ImageGenerationResult> {
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
+  const fetchImpl = mediaFetchFor(config);
   const model = requireModel(config.model, 'Nano Banana');
 
-  const response = await fetch(`${baseUrl}/v1beta/models/${model}:generateContent`, {
+  const response = await fetchImpl(`${baseUrl}/v1beta/models/${model}:generateContent`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

@@ -125,6 +125,14 @@ export interface ImageProviderConfig {
 }
 
 /**
+ * The `fetch`-shaped transport a media adapter issues every provider request
+ * with. Server callers pass the pinned provider transport
+ * (`lib/server/media-provider-fetch.ts`); left unset, adapters use the global
+ * `fetch`.
+ */
+export type MediaProviderFetch = (input: string, init?: RequestInit) => Promise<Response>;
+
+/**
  * Image Generation Configuration
  *
  * Runtime configuration for making image generation API calls.
@@ -139,6 +147,8 @@ export interface ImageGenerationConfig {
   baseUrl?: string;
   /** Optional model ID override (uses provider default if omitted) */
   model?: string;
+  /** Transport for provider requests (see {@link MediaProviderFetch}). */
+  fetchImpl?: MediaProviderFetch;
 }
 
 /**
@@ -252,6 +262,8 @@ export interface VideoGenerationConfig {
   baseUrl?: string;
   /** Optional model ID override (uses provider default if omitted) */
   model?: string;
+  /** Transport for provider requests (see {@link MediaProviderFetch}). */
+  fetchImpl?: MediaProviderFetch;
 }
 
 /**

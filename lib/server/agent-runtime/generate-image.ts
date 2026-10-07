@@ -20,7 +20,8 @@ import {
 import { createLogger } from '@/lib/logger';
 import { resolveImageSize } from '@/lib/server/image-sizing';
 import { recordGenerationUsage } from '@/lib/server/usage-storage';
-import { validateUrlForSSRF } from '@/lib/server/ssrf-guard';
+import { managedMediaProviderFetch } from '@/lib/server/media-provider-fetch';
+import { fetchProviderResultUrl } from '@/lib/server/provider-result-fetch';
 import {
   DownloadByteBudget,
   MAX_REMOTE_IMAGE_BATCH_BYTES,
@@ -96,25 +97,6 @@ function isTimeout(signal: AbortSignal): boolean {
   );
 }
 
-async function fetchGeneratedImage(url: string, signal: AbortSignal): Promise<Response> {
-  const maxRedirects = 5;
-  let currentUrl = url;
-  for (let hop = 0; ; hop++) {
-    throwIfAborted(signal);
-    const ssrfError = await validateUrlForSSRF(currentUrl);
-    throwIfAborted(signal);
-    if (ssrfError) throw new Error(ssrfError);
-
-    const response = await fetch(currentUrl, { redirect: 'manual', signal });
-    if (response.status < 300 || response.status >= 400) return response;
-
-    const location = response.headers.get('location');
-    if (!location) throw new Error('Image download redirect has no Location header');
-    if (hop >= maxRedirects) throw new Error('Image download exceeded 5 redirects');
-    currentUrl = new URL(location, currentUrl).href;
-  }
-}
-
 async function imageBytes(
   result: ImageGenerationResult,
   signal: AbortSignal,
@@ -129,7 +111,10 @@ async function imageBytes(
   }
   if (!result.url) throw new Error('Image provider returned neither URL nor image bytes');
 
-  const response = await fetchGeneratedImage(result.url, signal);
+  const response = await fetchProviderResultUrl(result.url, {
+    signal,
+    maxBytes: MAX_REMOTE_IMAGE_BYTES,
+  });
   if (!response.ok) throw new Error(`Generated image download failed: HTTP ${response.status}`);
   const mime = response.headers.get('content-type')?.split(';')[0]?.trim() || 'image/png';
   if (!mime.startsWith('image/')) {
@@ -200,6 +185,9 @@ export function buildGenerateImageTool(
       apiKey: resolveImageApiKey(providerId),
       baseUrl: resolveImageBaseUrl(providerId),
       model: resolveImageModel(providerId),
+      // The agent runtime resolves providers purely from server config, so the
+      // pinned managed transport applies (operator endpoints may be local).
+      fetchImpl: managedMediaProviderFetch,
     }));
   const callProvider = deps.generateConfiguredImage ?? generateImage;
   const persist = deps.persistGeneratedImage ?? defaultPersistGeneratedImage;

@@ -185,12 +185,15 @@ export function reorderQuestions(content: QuizContent, orderedIds: readonly stri
   return { ...content, questions: next };
 }
 
-/** Patch scalar question fields (question text, analysis, commentPrompt, points, hasAnswer). */
+/** Patch scalar question fields (question text, analysis, commentPrompt, points, hasAnswer, knowledgePoint). */
 export function updateQuestion(
   content: QuizContent,
   id: string,
   patch: Partial<
-    Pick<QuizQuestion, 'question' | 'analysis' | 'commentPrompt' | 'points' | 'hasAnswer'>
+    Pick<
+      QuizQuestion,
+      'question' | 'analysis' | 'commentPrompt' | 'points' | 'hasAnswer' | 'knowledgePoint'
+    >
   >,
 ): QuizContent {
   return mapQuestion(content, id, (q) => ({ ...q, ...patch }));

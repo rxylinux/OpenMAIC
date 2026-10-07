@@ -150,10 +150,18 @@ export async function PATCH(req: NextRequest, { params }: Params) {
         updatedAt: Date.now(),
       });
       await store.saveDocument({ ...document, stage });
+      // The rename contract echoes the name the server stored (its own trim)
+      // so callers render what was persisted — `apiRenameStage` reads it.
+      // Classification-only PATCHES keep their historical success-only shape:
+      // the echo rides along ONLY when the caller supplied a name.
+      return ownerJson(
+        name !== undefined ? { success: true, name: stage.name } : { success: true },
+        200,
+        responseHeaders,
+      );
     } catch (error) {
       return mapSaveError(error, responseHeaders);
     }
-    return ownerJson({ success: true }, 200, responseHeaders);
   });
 }
 

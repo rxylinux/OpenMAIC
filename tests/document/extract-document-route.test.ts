@@ -494,9 +494,12 @@ describe('POST /api/extract-document (asset-id form)', () => {
     expect(mocks.parseWithMinerUCloud).not.toHaveBeenCalled();
   });
 
-  it('lets the JSON path proceed when ALLOW_LOCAL_NETWORKS=true opts a local base URL in', async () => {
+  it('lets a MANAGED local base URL proceed without the opt-in (caller URLs are strict-public)', async () => {
     vi.stubEnv('NODE_ENV', 'development');
-    vi.stubEnv('ALLOW_LOCAL_NETWORKS', 'true');
+    delete process.env.ALLOW_LOCAL_NETWORKS;
+    mocks.isServerConfiguredProvider.mockReturnValue(true);
+    mocks.resolvePDFApiKey.mockReturnValue('server-key');
+    mocks.resolvePDFBaseUrl.mockReturnValue('http://192.168.1.10/v1/');
     mocks.resolveServerAsset.mockResolvedValue({
       status: 'resolved',
       buffer: Buffer.from('%PDF-1.4'),
@@ -518,10 +521,34 @@ describe('POST /api/extract-document (asset-id form)', () => {
       expect.objectContaining({
         providerId: 'mineru-cloud',
         baseUrl: 'http://192.168.1.10/v1/',
+        managed: true,
+        callerSuppliedBaseUrl: false,
       }),
-      expect.any(Buffer),
-      'lesson.pdf',
+      expect.anything(),
+      expect.anything(),
     );
+  });
+
+  it('rejects a caller local base URL even with the opt-in set', async () => {
+    vi.stubEnv('NODE_ENV', 'development');
+    vi.stubEnv('ALLOW_LOCAL_NETWORKS', 'true');
+    mocks.isServerConfiguredProvider.mockReturnValue(false);
+    mocks.resolveServerAsset.mockResolvedValue({
+      status: 'resolved',
+      buffer: Buffer.from('%PDF-1.4'),
+      mimeType: 'application/pdf',
+    });
+
+    const res = await postExtractDocumentByAssetId({
+      assetId: 'ast_abc',
+      fileName: 'lesson.pdf',
+      mimeType: 'application/pdf',
+      providerId: 'mineru-cloud',
+      baseUrl: 'http://192.168.1.10/v1/',
+    });
+
+    expect(res.status).toBe(403);
+    expect(mocks.parseWithMinerUCloud).not.toHaveBeenCalled();
   });
 
   it('returns 413 when the resolved server asset exceeds the 50 MB cap (post-resolve backstop)', async () => {

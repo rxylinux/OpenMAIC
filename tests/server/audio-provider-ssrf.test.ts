@@ -275,7 +275,11 @@ describe('audio provider adapters — SSRF hardening', () => {
   beforeEach(() => {
     dnsMocks.promisesLookup.mockReset();
     dnsMocks.callbackLookup.mockReset();
-    delete process.env.ALLOW_LOCAL_NETWORKS;
+    // The loopback origins in these cases are IP literals, which the transport
+    // now holds to the address policy on its own (patch-11 semantics): a
+    // self-hosted deployment reaches them with the operator opt-in set, as
+    // here. Cloud metadata stays refused under every policy.
+    process.env.ALLOW_LOCAL_NETWORKS = 'true';
   });
 
   afterEach(async () => {
